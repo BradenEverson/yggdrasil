@@ -2,12 +2,16 @@
 
 pub const Opcode = enum(u8) {
     nop,
+    ack,
+    nack,
     OPCODE_MAX,
 };
 
 pub fn payloadSize(comptime op: Opcode) comptime_int {
     return switch (op) {
         .nop => 0,
+        .ack => 1,
+        .nack => 1,
         .OPCODE_MAX => unreachable,
     };
 }
