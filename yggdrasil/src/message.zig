@@ -14,6 +14,6 @@ pub const NackReason = enum(u8) {
     checksum_mismatch,
 };
 
-pub const NackMessage = struct {
-    reason: NackReason,
+pub const NackMessage = union(NackReason) {
+    checksum_mismatch,
 };
