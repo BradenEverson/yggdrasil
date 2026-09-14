@@ -8,13 +8,13 @@ const Opcode = Packet.Opcode;
 
 pub const YggMessage = union(Opcode) {
     nop,
-    ack,
+    ack: AckMessage,
     nack: NackMessage,
 
     pub fn fromPacket(packet: Packet) ?YggMessage {
         return ret: switch (packet.op) {
             .nop => .nop,
-            .ack => .ack,
+            .ack => .{ .ack = .general },
             .nack => {
                 break :ret null;
             },
@@ -28,6 +28,16 @@ pub const NackReason = enum(u8) {
 
 pub const NackMessage = union(NackReason) {
     checksum_mismatch,
+};
+
+pub const AckType = enum(u8) {
+    general,
+    with_data,
+};
+
+pub const AckMessage = union(AckType) {
+    general,
+    with_data: []u8,
 };
 
 test "Simple packet to message" {
