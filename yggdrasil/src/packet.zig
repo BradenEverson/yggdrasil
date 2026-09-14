@@ -1,5 +1,7 @@
 //! Raw Packet structure
 
+pub const CRC = @import("packet/crc.zig");
+
 pub const Opcode = enum(u8) {
     nop,
     ack,

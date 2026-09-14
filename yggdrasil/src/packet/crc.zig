@@ -28,14 +28,22 @@ pub fn validateCRC(data: []const u8, crc: u16) bool {
 
 test "validate sequences" {
     const seq1 = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    try std.testing.expectEqual(@as(u16, 0x95E0), getCRC(&seq1));
+    try std.testing.expectEqual(0x95E0, getCRC(&seq1));
 
     const seq2 = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
-    try std.testing.expectEqual(@as(u16, 0x5458), getCRC(&seq2));
+    try std.testing.expectEqual(0x5458, getCRC(&seq2));
 }
 
 test "wrong crc" {
     var data = "123456789".*;
     const crc = getCRC(&data);
     try std.testing.expect(!validateCRC(&data, crc ^ 0x0001));
+}
+
+test "get crcs I need" {
+    const nop = [4]u8{ 0x72, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqual(0x4090, getCRC(&nop));
+
+    const ack = [8]u8{ 0x72, 0x01, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF };
+    try std.testing.expectEqual(0x4DA8, getCRC(&ack));
 }

@@ -20,8 +20,8 @@ pub const ParseState = enum {
     awaiting_len_msb,
     awaiting_len_lsb,
     reading_payload,
-    reading_crc_msb,
-    reading_crc_lsb,
+    awaiting_crc_msb,
+    awaiting_crc_lsb,
 };
 
 /// The middleware struct between a high level app layer
@@ -84,8 +84,7 @@ pub const Yggdrasil = struct {
 
                 if (ygg.building_packet.len == 0) {
                     ygg.building_packet.payload = ygg.packet_buffer[4..4];
-                    ygg.state = .awaiting_header;
-                    return ygg.building_packet;
+                    ygg.state = .awaiting_crc_msb;
                 } else {
                     ygg.state = .reading_payload;
                     ygg.cursor = 0;
@@ -97,13 +96,30 @@ pub const Yggdrasil = struct {
 
                 if (ygg.cursor == ygg.building_packet.len) {
                     ygg.building_packet.payload = ygg.packet_buffer[4 .. 4 + ygg.building_packet.len];
-                    ygg.state = .awaiting_header;
-                    return ygg.building_packet;
+                    ygg.state = .awaiting_crc_msb;
                 }
             },
 
-            .reading_crc_msb => {},
-            .reading_crc_lsb => {},
+            .awaiting_crc_msb => {
+                ygg.building_packet.crc = 0;
+                ygg.building_packet.crc |= byte;
+                ygg.building_packet.crc <<= 8;
+                ygg.state = .awaiting_crc_lsb;
+            },
+            .awaiting_crc_lsb => {
+                ygg.building_packet.crc |= byte;
+
+                ygg.state = .awaiting_header;
+
+                if (Packet.CRC.validateCRC(
+                    ygg.packet_buffer[0 .. ygg.building_packet.payload.len + 4],
+                    ygg.building_packet.crc,
+                )) {
+                    return ygg.building_packet;
+                } else {
+                    // Error callback here maybe in the future?
+                }
+            },
         }
 
         return null;
@@ -116,17 +132,19 @@ test {
 }
 
 fn nopRead(buf: []u8) YggdrasilError![]u8 {
-    const nop = [4]u8{ 0x72, 0x00, 0x00, 0x00 };
+    const nop = [6]u8{ 0x72, 0x00, 0x00, 0x00, 0x40, 0x90 };
     buf[0] = nop[0];
     buf[1] = nop[1];
     buf[2] = nop[2];
     buf[3] = nop[3];
+    buf[4] = nop[4];
+    buf[5] = nop[5];
 
-    return buf[0..4];
+    return buf[0..6];
 }
 
 fn ackWithPayloadRead(buf: []u8) YggdrasilError![]u8 {
-    const ack = [8]u8{ 0x72, 0x01, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF };
+    const ack = [10]u8{ 0x72, 0x01, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF, 0x4D, 0xA8 };
     buf[0] = ack[0];
     buf[1] = ack[1];
     buf[2] = ack[2];
@@ -135,8 +153,10 @@ fn ackWithPayloadRead(buf: []u8) YggdrasilError![]u8 {
     buf[5] = ack[5];
     buf[6] = ack[6];
     buf[7] = ack[7];
+    buf[8] = ack[8];
+    buf[9] = ack[9];
 
-    return buf[0..8];
+    return buf[0..10];
 }
 
 fn emptyWrite(buf: []u8) YggdrasilError!void {
