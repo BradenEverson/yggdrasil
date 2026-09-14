@@ -84,7 +84,7 @@ pub const Yggdrasil = struct {
                 }
             },
             .awaiting_opcode => {
-                if (byte < @intFromEnum(Opcode.OPCODE_MAX)) {
+                if (byte < Packet.PACKET_COUNT) {
                     ygg.building_packet.op = @enumFromInt(byte);
                     ygg.state = .awaiting_len_msb;
                     ygg.packet_buffer[1] = byte;

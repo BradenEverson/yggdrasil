@@ -7,7 +7,6 @@ pub const Opcode = enum(u8) {
     nop,
     ack,
     nack,
-    OPCODE_MAX,
 };
 
 pub fn payloadSize(comptime op: Opcode) comptime_int {
@@ -15,14 +14,15 @@ pub fn payloadSize(comptime op: Opcode) comptime_int {
         .nop => 0,
         .ack => 4,
         .nack => 1,
-        .OPCODE_MAX => unreachable,
     };
 }
+
+pub const PACKET_COUNT = 3;
 
 pub fn largestPayload() comptime_int {
     var max: comptime_int = 0;
 
-    comptime for (0..@intFromEnum(Opcode.OPCODE_MAX)) |i| {
+    comptime for (0..PACKET_COUNT) |i| {
         const size = payloadSize(@enumFromInt(i));
         if (size > max) {
             max = size;
