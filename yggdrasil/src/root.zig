@@ -49,7 +49,14 @@ pub const Yggdrasil = struct {
 
         for (bytes) |byte| {
             if (ygg.readByte(byte)) |packet| {
-                ygg.result_cb(packet);
+                if (Packet.CRC.validateCRC(
+                    ygg.packet_buffer[0 .. ygg.building_packet.payload.len + 4],
+                    ygg.building_packet.crc,
+                )) {
+                    ygg.result_cb(packet);
+                } else {
+                    // Error callback here?
+                }
             }
         }
     }
@@ -110,15 +117,7 @@ pub const Yggdrasil = struct {
                 ygg.building_packet.crc |= byte;
 
                 ygg.state = .awaiting_header;
-
-                if (Packet.CRC.validateCRC(
-                    ygg.packet_buffer[0 .. ygg.building_packet.payload.len + 4],
-                    ygg.building_packet.crc,
-                )) {
-                    return ygg.building_packet;
-                } else {
-                    // Error callback here maybe in the future?
-                }
+                return ygg.building_packet;
             },
         }
 
