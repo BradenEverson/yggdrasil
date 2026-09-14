@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const Packet = @import("packet.zig");
 pub const Opcode = Packet.Opcode;
+pub const Message = @import("message.zig");
 
 /// Errors that are common to most APIs and
 /// communication methods
@@ -43,6 +44,7 @@ pub const Yggdrasil = struct {
     packet_buffer: [LARGEST_PACKET_SIZE]u8 = undefined,
 
     result_cb: *const fn (packet: Packet) void,
+    failure_cb: ?*const fn (reason: Message.NackReason) void = null,
 
     building_packet: Packet = .{},
 
@@ -57,9 +59,12 @@ pub const Yggdrasil = struct {
                 )) {
                     ygg.result_cb(packet);
                 } else {
-                    // Error callback here?
-                    // Send a NACK at least
 
+                    // Call error callback!
+                    if (ygg.failure_cb) |failure_cb|
+                        failure_cb(.checksum_mismatch);
+
+                    // Send a NACK too
                     ygg.packet_buffer[0] = 0x00; // malformed packet nack
                     const nack = Packet{
                         .op = .nack,
