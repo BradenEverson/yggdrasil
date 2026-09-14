@@ -53,7 +53,7 @@ pub const Yggdrasil = struct {
             if (ygg.readByte(byte)) |packet| {
                 if (Packet.CRC.validateCRC(
                     ygg.packet_buffer[0 .. ygg.building_packet.payload.len + 4],
-                    ygg.building_packet.crc,
+                    ygg.building_packet.crc.?,
                 )) {
                     ygg.result_cb(packet);
                 } else {
@@ -65,7 +65,7 @@ pub const Yggdrasil = struct {
                         .op = .nack,
                         .len = 1,
                         .payload = ygg.packet_buffer[0..1],
-                        .crc = 0x8B38,
+                        .crc = null,
                     };
 
                     const nack_packet = nack.toBuffer(&ygg.packet_buffer);
@@ -123,12 +123,12 @@ pub const Yggdrasil = struct {
 
             .awaiting_crc_msb => {
                 ygg.building_packet.crc = 0;
-                ygg.building_packet.crc |= byte;
-                ygg.building_packet.crc <<= 8;
+                ygg.building_packet.crc.? |= byte;
+                ygg.building_packet.crc.? <<= 8;
                 ygg.state = .awaiting_crc_lsb;
             },
             .awaiting_crc_lsb => {
-                ygg.building_packet.crc |= byte;
+                ygg.building_packet.crc.? |= byte;
 
                 ygg.state = .awaiting_header;
                 return ygg.building_packet;

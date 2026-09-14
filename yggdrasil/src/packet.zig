@@ -37,7 +37,7 @@ pub const HEADER: u8 = 0x72;
 op: Opcode = .nop,
 len: u16 = 0,
 payload: []u8 = undefined,
-crc: u16 = 0,
+crc: ?u16 = null,
 
 const Packet = @This();
 
@@ -55,8 +55,13 @@ pub fn toBuffer(self: *const Packet, buf: []u8) []u8 {
         buf[4 + i] = byte;
     }
 
-    const crc_msb: u8 = @truncate(self.crc >> 8);
-    const crc_lsb: u8 = @truncate(self.crc >> 0);
+    const crc = if (self.crc) |crc|
+        crc
+    else
+        CRC.getCRC(buf[0..self.payload.len]);
+
+    const crc_msb: u8 = @truncate(crc >> 8);
+    const crc_lsb: u8 = @truncate(crc >> 0);
 
     buf[4 + self.payload.len + 0] = crc_msb;
     buf[4 + self.payload.len + 1] = crc_lsb;
