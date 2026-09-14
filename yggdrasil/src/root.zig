@@ -76,13 +76,23 @@ pub const Yggdrasil = struct {
                 ygg.building_packet.len |= byte;
                 if (ygg.building_packet.len == 0) {
                     ygg.building_packet.payload = ygg.packet_buffer[0..0];
+                    ygg.state = .awaiting_header;
                     return ygg.building_packet;
                 } else {
                     ygg.state = .reading_payload;
                     ygg.cursor = 0;
                 }
             },
-            .reading_payload => {},
+            .reading_payload => {
+                ygg.packet_buffer[ygg.cursor] = byte;
+                ygg.cursor += 1;
+
+                if (ygg.cursor == ygg.building_packet.len) {
+                    ygg.building_packet.payload = ygg.packet_buffer[0..ygg.building_packet.len];
+                    ygg.state = .awaiting_header;
+                    return ygg.building_packet;
+                }
+            },
         }
 
         return null;
@@ -104,6 +114,20 @@ fn nopRead(buf: []u8) YggdrasilError![]u8 {
     return buf[0..4];
 }
 
+fn ackWithPayloadRead(buf: []u8) YggdrasilError![]u8 {
+    const ack = [8]u8{ 0x72, 0x01, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF };
+    buf[0] = ack[0];
+    buf[1] = ack[1];
+    buf[2] = ack[2];
+    buf[3] = ack[3];
+    buf[4] = ack[4];
+    buf[5] = ack[5];
+    buf[6] = ack[6];
+    buf[7] = ack[7];
+
+    return buf[0..8];
+}
+
 fn emptyWrite(buf: []u8) YggdrasilError!void {
     _ = buf;
 }
@@ -117,6 +141,19 @@ test "Simple packet parsing" {
 
     var ygg = Yggdrasil{
         .read_bytes_fn = nopRead,
+        .write_bytes_fn = emptyWrite,
+        .result_cb = yay,
+        .buffer = &buffer,
+    };
+
+    try ygg.readStream();
+}
+
+test "Payload packet parsing" {
+    var buffer: [64]u8 = undefined;
+
+    var ygg = Yggdrasil{
+        .read_bytes_fn = ackWithPayloadRead,
         .write_bytes_fn = emptyWrite,
         .result_cb = yay,
         .buffer = &buffer,
