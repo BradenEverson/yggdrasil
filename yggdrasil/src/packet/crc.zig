@@ -9,8 +9,8 @@ pub fn getCRC(data: []const u8) u16 {
 
     for (data) |byte| {
         crc ^= @as(u16, byte) << 8;
-        var i: u8 = 0;
-        while (i < 8) : (i += 1) {
+
+        for (0..8) |_| {
             if (crc & 0x8000 != 0) {
                 crc = (crc << 1) ^ GENERATOR;
             } else {
