@@ -10,7 +10,7 @@ pub const Opcode = enum(u8) {
 pub fn payloadSize(comptime op: Opcode) comptime_int {
     return switch (op) {
         .nop => 0,
-        .ack => 1,
+        .ack => 4,
         .nack => 1,
         .OPCODE_MAX => unreachable,
     };
@@ -33,3 +33,7 @@ op: Opcode = .nop,
 len: u16 = 0,
 payload: []u8 = undefined,
 crc: u16 = 0,
+
+test {
+    _ = @import("packet/crc.zig");
+}

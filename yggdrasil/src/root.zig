@@ -10,7 +10,7 @@ pub const Opcode = Packet.Opcode;
 pub const YggdrasilError = error{};
 
 const HEADER: u8 = 0x72;
-const LARGEST_PACKET_SIZE: usize = 1 + 2 + Packet.largestPayload();
+const LARGEST_PACKET_SIZE: usize = 1 + 1 + 2 + Packet.largestPayload() + 2;
 
 /// The states we can be in while reading
 /// from the incoming stream
@@ -20,6 +20,8 @@ pub const ParseState = enum {
     awaiting_len_msb,
     awaiting_len_lsb,
     reading_payload,
+    reading_crc_msb,
+    reading_crc_lsb,
 };
 
 /// The middleware struct between a high level app layer
@@ -55,13 +57,16 @@ pub const Yggdrasil = struct {
     pub fn readByte(ygg: *Yggdrasil, byte: u8) ?Packet {
         switch (ygg.state) {
             .awaiting_header => {
-                if (byte == HEADER)
+                if (byte == HEADER) {
                     ygg.state = .awaiting_opcode;
+                    ygg.packet_buffer[0] = byte;
+                }
             },
             .awaiting_opcode => {
                 if (byte < @intFromEnum(Opcode.OPCODE_MAX)) {
                     ygg.building_packet.op = @enumFromInt(byte);
                     ygg.state = .awaiting_len_msb;
+                    ygg.packet_buffer[1] = byte;
                 } else {
                     ygg.state = .awaiting_header;
                 }
@@ -71,11 +76,14 @@ pub const Yggdrasil = struct {
                 ygg.building_packet.len |= byte;
                 ygg.building_packet.len <<= 8;
                 ygg.state = .awaiting_len_lsb;
+                ygg.packet_buffer[2] = byte;
             },
             .awaiting_len_lsb => {
                 ygg.building_packet.len |= byte;
+                ygg.packet_buffer[3] = byte;
+
                 if (ygg.building_packet.len == 0) {
-                    ygg.building_packet.payload = ygg.packet_buffer[0..0];
+                    ygg.building_packet.payload = ygg.packet_buffer[4..4];
                     ygg.state = .awaiting_header;
                     return ygg.building_packet;
                 } else {
@@ -84,15 +92,18 @@ pub const Yggdrasil = struct {
                 }
             },
             .reading_payload => {
-                ygg.packet_buffer[ygg.cursor] = byte;
+                ygg.packet_buffer[4 + ygg.cursor] = byte;
                 ygg.cursor += 1;
 
                 if (ygg.cursor == ygg.building_packet.len) {
-                    ygg.building_packet.payload = ygg.packet_buffer[0..ygg.building_packet.len];
+                    ygg.building_packet.payload = ygg.packet_buffer[4 .. 4 + ygg.building_packet.len];
                     ygg.state = .awaiting_header;
                     return ygg.building_packet;
                 }
             },
+
+            .reading_crc_msb => {},
+            .reading_crc_lsb => {},
         }
 
         return null;
@@ -134,6 +145,11 @@ fn emptyWrite(buf: []u8) YggdrasilError!void {
 
 fn yay(packet: Packet) void {
     std.debug.print("{any}\n", .{packet});
+}
+
+test {
+    _ = @import("packet.zig");
+    _ = @import("message.zig");
 }
 
 test "Simple packet parsing" {
