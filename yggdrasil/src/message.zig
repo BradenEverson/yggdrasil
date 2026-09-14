@@ -6,4 +6,10 @@ const Opcode = Packet.Opcode;
 
 pub const YggMessage = union(Opcode) {
     nop,
+    ack,
+    nack: NackMessage,
+};
+
+pub const NackMessage = struct {
+    reason: enum(u8) { checksum_mismatch },
 };

@@ -8,18 +8,20 @@ pub const Opcode = Packet.Opcode;
 /// Errors that are common to most APIs and
 /// communication methods
 pub const YggdrasilError = error{};
-
-const HEADER: u8 = 0x72;
 const LARGEST_PACKET_SIZE: usize = 1 + 1 + 2 + Packet.largestPayload() + 2;
 
 /// The states we can be in while reading
 /// from the incoming stream
 pub const ParseState = enum {
     awaiting_header,
+
     awaiting_opcode,
+
     awaiting_len_msb,
     awaiting_len_lsb,
+
     reading_payload,
+
     awaiting_crc_msb,
     awaiting_crc_lsb,
 };
@@ -56,6 +58,18 @@ pub const Yggdrasil = struct {
                     ygg.result_cb(packet);
                 } else {
                     // Error callback here?
+                    // Send a NACK at least
+
+                    ygg.packet_buffer[0] = 0x00; // malformed packet nack
+                    const nack = Packet{
+                        .op = .nack,
+                        .len = 1,
+                        .payload = ygg.packet_buffer[0..1],
+                        .crc = 0x8B38,
+                    };
+
+                    const nack_packet = nack.toBuffer(&ygg.packet_buffer);
+                    try ygg.write_bytes_fn(nack_packet);
                 }
             }
         }
@@ -64,7 +78,7 @@ pub const Yggdrasil = struct {
     pub fn readByte(ygg: *Yggdrasil, byte: u8) ?Packet {
         switch (ygg.state) {
             .awaiting_header => {
-                if (byte == HEADER) {
+                if (byte == Packet.HEADER) {
                     ygg.state = .awaiting_opcode;
                     ygg.packet_buffer[0] = byte;
                 }
