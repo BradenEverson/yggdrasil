@@ -10,6 +10,10 @@ pub const YggMessage = union(Opcode) {
     nack: NackMessage,
 };
 
+pub const NackReason = enum(u8) {
+    checksum_mismatch,
+};
+
 pub const NackMessage = struct {
-    reason: enum(u8) { checksum_mismatch },
+    reason: NackReason,
 };
