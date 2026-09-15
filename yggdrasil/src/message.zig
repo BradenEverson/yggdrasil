@@ -15,7 +15,11 @@ pub const YggMessage = union(Opcode) {
         return ret: switch (packet.op) {
             .nop => .nop,
             .ack => switch (packet.payload[0]) {
-                0x00 => .{ .ack = .general },
+                @intFromEnum(AckType.general) => .{ .ack = .general },
+
+                @intFromEnum(AckType.with_data) => .{
+                    .ack = .{ .with_data = packet.payload[1..] },
+                },
                 else => null,
             },
             .nack => {
@@ -40,7 +44,7 @@ pub const AckType = enum(u8) {
 
 pub const AckMessage = union(AckType) {
     general,
-    with_data: []u8,
+    with_data: []const u8,
 };
 
 test "Simple packet to message" {
@@ -49,13 +53,22 @@ test "Simple packet to message" {
     try std.testing.expectEqual(YggMessage.nop, msg.?);
 }
 
-test "ack" {
+test "acks" {
     const payload = [1]u8{0x00};
     const ack = Packet{
         .op = .ack,
         .payload = &payload,
     };
-    const msg: ?YggMessage = .fromPacket(ack);
+    var msg: ?YggMessage = .fromPacket(ack);
 
     try std.testing.expectEqual(YggMessage{ .ack = .general }, msg.?);
+
+    const payload2 = [6]u8{ 0x01, 'h', 'e', 'l', 'l', 'o' };
+    const ack_with_data = Packet{
+        .op = .ack,
+        .payload = &payload2,
+    };
+    msg = .fromPacket(ack_with_data);
+
+    try std.testing.expectEqualSlices(u8, "hello", msg.?.ack.with_data);
 }
