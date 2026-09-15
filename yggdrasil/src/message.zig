@@ -12,7 +12,7 @@ pub const YggMessage = union(Opcode) {
     nack: NackMessage,
 
     pub fn fromPacket(packet: Packet) ?YggMessage {
-        return ret: switch (packet.op) {
+        return switch (packet.op) {
             .nop => .nop,
             .ack => switch (packet.payload[0]) {
                 @intFromEnum(AckType.general) => .{ .ack = .general },
@@ -22,8 +22,12 @@ pub const YggMessage = union(Opcode) {
                 },
                 else => null,
             },
-            .nack => {
-                break :ret null;
+
+            .nack => switch (packet.payload[0]) {
+                @intFromEnum(NackReason.checksum_mismatch) => .{
+                    .nack = .checksum_mismatch,
+                },
+                else => null,
             },
         };
     }
@@ -71,4 +75,15 @@ test "acks" {
     msg = .fromPacket(ack_with_data);
 
     try std.testing.expectEqualSlices(u8, "hello", msg.?.ack.with_data);
+}
+
+test "nacks" {
+    const payload = [1]u8{0x00};
+    const nack = Packet{
+        .op = .nack,
+        .payload = &payload,
+    };
+    const msg: ?YggMessage = .fromPacket(nack);
+
+    try std.testing.expectEqual(YggMessage{ .nack = .checksum_mismatch }, msg.?);
 }
