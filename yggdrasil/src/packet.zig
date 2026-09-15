@@ -36,7 +36,7 @@ pub const HEADER: u8 = 0x72;
 
 op: Opcode = .nop,
 len: u16 = 0,
-payload: []u8 = undefined,
+payload: []const u8 = undefined,
 crc: ?u16 = null,
 
 const Packet = @This();

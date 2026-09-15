@@ -14,7 +14,10 @@ pub const YggMessage = union(Opcode) {
     pub fn fromPacket(packet: Packet) ?YggMessage {
         return ret: switch (packet.op) {
             .nop => .nop,
-            .ack => .{ .ack = .general },
+            .ack => switch (packet.payload[0]) {
+                0x00 => .{ .ack = .general },
+                else => null,
+            },
             .nack => {
                 break :ret null;
             },
@@ -44,4 +47,15 @@ test "Simple packet to message" {
     const msg: ?YggMessage = .fromPacket(.{});
 
     try std.testing.expectEqual(YggMessage.nop, msg.?);
+}
+
+test "ack" {
+    const payload = [1]u8{0x00};
+    const ack = Packet{
+        .op = .ack,
+        .payload = &payload,
+    };
+    const msg: ?YggMessage = .fromPacket(ack);
+
+    try std.testing.expectEqual(YggMessage{ .ack = .general }, msg.?);
 }
