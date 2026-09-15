@@ -33,10 +33,10 @@ pub fn setPin(port: c_uint, pins: struct {
     if (ret != sys.ESP_OK) return error.SetPinFailed;
 }
 
-var rx_buf: [64]u8 = undefined;
-var tx_buf: [64]u8 = undefined;
-
 fn main() callconv(.c) void {
+    var rx_buf: [BUF_SIZE]u8 = undefined;
+    var tx_buf: [BUF_SIZE]u8 = undefined;
+
     var heap = idf.heap.HeapCapsAllocator.init(.{ .@"8bit" = true });
     var arena = std.heap.ArenaAllocator.init(heap.allocator());
     defer arena.deinit();
@@ -72,6 +72,8 @@ fn main() callconv(.c) void {
         log.err("Write failed!!!", .{});
         unreachable;
     };
+
+    idf.rtos.Task.delayMs(100);
 
     const n = idf.uart.readBytes(UART_PORT, &rx_buf, 0) catch {
         log.err("Read failed!!!", .{});
