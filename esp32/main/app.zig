@@ -35,13 +35,25 @@ pub fn setPin(port: c_uint, pins: struct {
 
 fn main() callconv(.c) void {
     var rx_buf: [BUF_SIZE]u8 = undefined;
-    var tx_buf: [BUF_SIZE]u8 = undefined;
+    // var tx_buf: [BUF_SIZE]u8 = undefined;
 
     var heap = idf.heap.HeapCapsAllocator.init(.{ .@"8bit" = true });
     var arena = std.heap.ArenaAllocator.init(heap.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
     _ = allocator;
+
+    log.info("Restarting LoRA Module", .{});
+
+    const rst_bar = .@"41";
+    idf.gpio.Direction.set(rst_bar, .output) catch unreachable;
+    idf.gpio.Level.set(rst_bar, 0) catch unreachable;
+
+    idf.rtos.Task.delayMs(100);
+
+    idf.gpio.Level.set(rst_bar, 1) catch unreachable;
+
+    idf.rtos.Task.delayMs(3500);
 
     log.info("Let's Mesh This Network", .{});
 
@@ -62,27 +74,20 @@ fn main() callconv(.c) void {
 
     log.info("UART ready", .{});
 
-    tx_buf[0] = 'h';
-    tx_buf[1] = 'e';
-    tx_buf[2] = 'l';
-    tx_buf[3] = 'l';
-    tx_buf[4] = 'o';
-
-    _ = idf.uart.writeBytes(UART_PORT, tx_buf[0..5]) catch {
+    _ = idf.uart.writeBytes(UART_PORT, "AT+RESET\r\n") catch {
         log.err("Write failed!!!", .{});
         unreachable;
     };
 
-    idf.rtos.Task.delayMs(100);
-
-    const n = idf.uart.readBytes(UART_PORT, &rx_buf, 0) catch {
-        log.err("Read failed!!!", .{});
-        unreachable;
-    };
-    log.info("{s}", .{rx_buf[0..n]});
-
     while (true) {
         idf.rtos.Task.delayMs(100);
+
+        const n = idf.uart.readBytes(UART_PORT, &rx_buf, 0) catch {
+            log.err("Read failed!!!", .{});
+            unreachable;
+        };
+        if (n > 0)
+            log.info("{s}", .{rx_buf[0..n]});
     }
 }
 
