@@ -6,6 +6,8 @@ const ver = idf.ver.Version;
 const sys = idf.sys;
 const mem = std.mem;
 
+const Rylr896 = @import("rylr896.zig");
+
 const UART_PORT: c_uint = 1; // UART1
 const BAUD_RATE = 115200;
 const BUF_SIZE = 256;
@@ -35,7 +37,14 @@ pub fn setPin(port: c_uint, pins: struct {
 
 fn main() callconv(.c) void {
     var rx_buf: [BUF_SIZE]u8 = undefined;
-    // var tx_buf: [BUF_SIZE]u8 = undefined;
+    var tx_buf: [BUF_SIZE]u8 = undefined;
+
+    const rylr896: Rylr896 = .{
+        .port = UART_PORT,
+        .rx_buffer = &rx_buf,
+        .tx_buffer = &tx_buf,
+    };
+    _ = rylr896;
 
     var heap = idf.heap.HeapCapsAllocator.init(.{ .@"8bit" = true });
     var arena = std.heap.ArenaAllocator.init(heap.allocator());
