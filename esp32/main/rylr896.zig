@@ -13,6 +13,45 @@ pub fn reset(self: *Self) !void {
     _ = try idf.uart.writeBytes(self.port, "AT+RESET\r\n");
 }
 
+pub const RylrError = error{
+    NoEnter,
+    HeadNotAT,
+    NoEquals,
+    UnknownCommand,
+    TxOverTimes,
+    RxOverTimes,
+    CrcError,
+    TxGreaterThan240,
+    UnknownError,
+};
+
+fn send(self: *Self, msg: []const u8) !void {
+    _ = try idf.uart.writeBytes(self.port, msg);
+
+    const n = try idf.uart.readBytes(self.port, self.rx_buffer, 1000);
+    const resp = self.rx_buffer[0..n];
+
+    if (std.mem.startsWith(u8, resp, "+OK")) {
+        return;
+    }
+    if (std.mem.startsWith(u8, resp, "+ERR=")) {
+        const code_str = std.mem.trimEnd(u8, resp["+ERR=".len..], "\r\n");
+        const code = std.fmt.parseInt(u8, code_str, 10) catch return RylrError.UnknownError;
+        return switch (code) {
+            1 => RylrError.NoEnter,
+            2 => RylrError.HeadNotAT,
+            3 => RylrError.NoEquals,
+            4 => RylrError.UnknownCommand,
+            10 => RylrError.TxOverTimes,
+            11 => RylrError.RxOverTimes,
+            12 => RylrError.CrcError,
+            13 => RylrError.TxGreaterThan240,
+            else => RylrError.UnknownError,
+        };
+    }
+    return RylrError.UnknownError;
+}
+
 pub fn setNetwork(self: *Self, net: u16) !void {
     const msg = try std.mem.print(
         self.tx_buffer,
@@ -33,14 +72,14 @@ pub fn setAddr(self: *Self, addr: u16) !void {
     _ = try idf.uart.writeBytes(self.port, msg);
 }
 
-pub fn sendString(self: *Self, to: u16, msg: []const u8) !void {
-    const send = try std.mem.print(
+pub fn sendString(self: *Self, to: u16, message: []const u8) !void {
+    const msg = try std.mem.print(
         self.tx_buffer,
         "AT+SEND={},{},{s}\r\n",
-        .{ to, msg.len, msg },
+        .{ to, message.len, message },
     );
 
-    _ = try idf.uart.writeBytes(self.port, send);
+    try self.send(msg);
 }
 
 pub fn sendData(self: *Self, to: u16, data: []const u8) !void {
@@ -58,5 +97,5 @@ pub fn sendData(self: *Self, to: u16, data: []const u8) !void {
     self.tx_buffer[header.len + data.len] = '\r';
     self.tx_buffer[header.len + data.len + 1] = '\n';
 
-    _ = try idf.uart.writeBytes(self.port, self.tx_buffer[0..total_len]);
+    try self.send(self.tx_buffer[0..total_len]);
 }

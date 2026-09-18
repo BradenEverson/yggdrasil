@@ -109,44 +109,30 @@ fn main() callconv(.c) void {
         log.err("setAddr failed!!!", .{});
         unreachable;
     };
-    idf.rtos.Task.delayMs(200);
+    idf.rtos.Task.delayMs(1000);
 
     log.info("Node {} ready, heartbeating to {}", .{ NODE_ADDR, TARGET_ADDR });
 
-    var elapsed_ms: u32 = 0;
     var heartbeat_count: u32 = 0;
 
     while (true) {
-        idf.rtos.Task.delayMs(10);
-        elapsed_ms += 10;
+        heartbeat_count += 1;
 
-        const n = idf.uart.readBytes(UART_PORT, &rx_buf, 0) catch {
-            log.err("Read failed!!!", .{});
-            unreachable;
+        var msg_buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &msg_buf,
+            "ping #{} from {}",
+            .{ heartbeat_count, NODE_ADDR },
+        ) catch {
+            log.err("Failed to format heartbeat!!!", .{});
+            continue;
         };
-        if (n > 0)
-            log.info("{s}", .{rx_buf[0..n]});
 
-        if (elapsed_ms >= HEARTBEAT_PERIOD_MS) {
-            elapsed_ms = 0;
-            heartbeat_count += 1;
-
-            var msg_buf: [32]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &msg_buf,
-                "ping #{} from {}",
-                .{ heartbeat_count, NODE_ADDR },
-            ) catch {
-                log.err("Failed to format heartbeat!!!", .{});
-                continue;
-            };
-
-            rylr896.sendString(TARGET_ADDR, msg) catch {
-                log.err("sendString failed!!!", .{});
-                continue;
-            };
-            log.info("Sent: {s}", .{msg});
-        }
+        rylr896.sendString(TARGET_ADDR, msg) catch |e| {
+            log.err("sendString failed: {any}", .{e});
+            continue;
+        };
+        log.info("Sent: {s}", .{msg});
     }
 }
 
