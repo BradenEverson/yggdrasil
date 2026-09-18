@@ -15,6 +15,14 @@ const BUF_SIZE = 256;
 const TX_PIN: c_int = 43;
 const RX_PIN: c_int = 44;
 
+// Mesh test config: flash board A with NODE_ADDR = 1, TARGET_ADDR = 2,
+// and board B with NODE_ADDR = 2, TARGET_ADDR = 1, to prove point-to-point
+// comms before building out real mesh routing on top of this.
+const NETWORK_ID: u16 = 18;
+const NODE_ADDR: u16 = 1;
+const TARGET_ADDR: u16 = 2;
+const HEARTBEAT_PERIOD_MS: u32 = 2000;
+
 comptime {
     @export(&main, .{ .name = "app_main" });
 }
@@ -82,13 +90,35 @@ fn main() callconv(.c) void {
 
     log.info("UART ready", .{});
 
-    _ = rylr896.reset() catch {
-        log.err("Write failed!!!", .{});
+    rylr896.reset() catch {
+        log.err("Reset command failed!!!", .{});
         unreachable;
     };
 
+    idf.rtos.Task.delayMs(1000);
+
+    log.info("Configuring network id={} addr={}", .{ NETWORK_ID, NODE_ADDR });
+
+    rylr896.setNetwork(NETWORK_ID) catch {
+        log.err("setNetwork failed!!!", .{});
+        unreachable;
+    };
+    idf.rtos.Task.delayMs(200);
+
+    rylr896.setAddr(NODE_ADDR) catch {
+        log.err("setAddr failed!!!", .{});
+        unreachable;
+    };
+    idf.rtos.Task.delayMs(200);
+
+    log.info("Node {} ready, heartbeating to {}", .{ NODE_ADDR, TARGET_ADDR });
+
+    var elapsed_ms: u32 = 0;
+    var heartbeat_count: u32 = 0;
+
     while (true) {
         idf.rtos.Task.delayMs(100);
+        elapsed_ms += 100;
 
         const n = idf.uart.readBytes(UART_PORT, &rx_buf, 0) catch {
             log.err("Read failed!!!", .{});
@@ -96,6 +126,27 @@ fn main() callconv(.c) void {
         };
         if (n > 0)
             log.info("{s}", .{rx_buf[0..n]});
+
+        if (elapsed_ms >= HEARTBEAT_PERIOD_MS) {
+            elapsed_ms = 0;
+            heartbeat_count += 1;
+
+            var msg_buf: [32]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "ping #{} from {}",
+                .{ heartbeat_count, NODE_ADDR },
+            ) catch {
+                log.err("Failed to format heartbeat!!!", .{});
+                continue;
+            };
+
+            rylr896.sendString(TARGET_ADDR, msg) catch {
+                log.err("sendString failed!!!", .{});
+                continue;
+            };
+            log.info("Sent: {s}", .{msg});
+        }
     }
 }
 

@@ -14,7 +14,7 @@ pub fn reset(self: *Self) !void {
 }
 
 pub fn setNetwork(self: *Self, net: u16) !void {
-    const msg = std.fmt.bufPrint(
+    const msg = try std.mem.print(
         self.tx_buffer,
         "AT+NETWORKID={}\r\n",
         .{net},
@@ -24,7 +24,7 @@ pub fn setNetwork(self: *Self, net: u16) !void {
 }
 
 pub fn setAddr(self: *Self, addr: u16) !void {
-    const msg = std.fmt.bufPrint(
+    const msg = try std.mem.print(
         self.tx_buffer,
         "AT+ADDRESS={}\r\n",
         .{addr},
@@ -34,7 +34,7 @@ pub fn setAddr(self: *Self, addr: u16) !void {
 }
 
 pub fn sendString(self: *Self, to: u16, msg: []const u8) !void {
-    const send = std.fmt.bufPrint(
+    const send = try std.mem.print(
         self.tx_buffer,
         "AT+SEND={},{},{s}\r\n",
         .{ to, msg.len, msg },
@@ -44,7 +44,7 @@ pub fn sendString(self: *Self, to: u16, msg: []const u8) !void {
 }
 
 pub fn sendData(self: *Self, to: u16, data: []const u8) !void {
-    const header = try std.fmt.bufPrint(
+    const header = try std.mem.print(
         self.tx_buffer,
         "AT+SEND={},{},",
         .{ to, data.len },
