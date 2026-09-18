@@ -117,8 +117,8 @@ fn main() callconv(.c) void {
     var heartbeat_count: u32 = 0;
 
     while (true) {
-        idf.rtos.Task.delayMs(100);
-        elapsed_ms += 100;
+        idf.rtos.Task.delayMs(10);
+        elapsed_ms += 10;
 
         const n = idf.uart.readBytes(UART_PORT, &rx_buf, 0) catch {
             log.err("Read failed!!!", .{});
