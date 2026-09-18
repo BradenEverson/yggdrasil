@@ -33,7 +33,7 @@ pub fn setAddr(self: *Self, addr: u16) !void {
     _ = try idf.uart.writeBytes(self.port, msg);
 }
 
-pub fn sendData(self: *Self, to: u16, msg: []const u8) !void {
+pub fn sendString(self: *Self, to: u16, msg: []const u8) !void {
     const send = std.fmt.bufPrint(
         self.tx_buffer,
         "AT+SEND={},{},{s}\r\n",
@@ -41,4 +41,22 @@ pub fn sendData(self: *Self, to: u16, msg: []const u8) !void {
     );
 
     _ = try idf.uart.writeBytes(self.port, send);
+}
+
+pub fn sendData(self: *Self, to: u16, data: []const u8) !void {
+    const header = try std.fmt.bufPrint(
+        self.tx_buffer,
+        "AT+SEND={},{},",
+        .{ to, data.len },
+    );
+
+    const total_len = header.len + data.len + 2;
+    if (total_len > self.tx_buffer.len) return error.BufferTooSmall;
+
+    @memcpy(self.tx_buffer[header.len..][0..data.len], data);
+
+    self.tx_buffer[header.len + data.len] = '\r';
+    self.tx_buffer[header.len + data.len + 1] = '\n';
+
+    _ = try idf.uart.writeBytes(self.port, self.tx_buffer[0..total_len]);
 }
