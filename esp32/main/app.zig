@@ -39,12 +39,11 @@ fn main() callconv(.c) void {
     var rx_buf: [BUF_SIZE]u8 = undefined;
     var tx_buf: [BUF_SIZE]u8 = undefined;
 
-    const rylr896: Rylr896 = .{
+    var rylr896: Rylr896 = .{
         .port = UART_PORT,
         .rx_buffer = &rx_buf,
         .tx_buffer = &tx_buf,
     };
-    _ = rylr896;
 
     var heap = idf.heap.HeapCapsAllocator.init(.{ .@"8bit" = true });
     var arena = std.heap.ArenaAllocator.init(heap.allocator());
@@ -83,7 +82,7 @@ fn main() callconv(.c) void {
 
     log.info("UART ready", .{});
 
-    _ = idf.uart.writeBytes(UART_PORT, "AT+RESET\r\n") catch {
+    _ = rylr896.reset() catch {
         log.err("Write failed!!!", .{});
         unreachable;
     };
