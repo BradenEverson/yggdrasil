@@ -3,9 +3,6 @@ import re
 import time
 
 class RYLR896:
-    RCV_HEADER = re.compile(rb"\+RCV=(\d+),(\d+),")
-    RCV_FOOTER = re.compile(rb"^,(-?\d+),(-?\d+)\r\n")
-
     def __init__(self, port="/dev/ttyTHS1", baud=115200):
         self.ser = serial.Serial(port, baud, timeout=0.5)
         self.on_receive = None
@@ -32,7 +29,6 @@ class RYLR896:
 
         while self._try_parse_buffer():
             pass
-
 
     def _try_parse_buffer(self):
         buf = self._buffer
