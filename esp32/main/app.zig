@@ -15,9 +15,6 @@ const BUF_SIZE = 256;
 const TX_PIN: c_int = 43;
 const RX_PIN: c_int = 44;
 
-// Mesh test config: flash board A with NODE_ADDR = 1, TARGET_ADDR = 2,
-// and board B with NODE_ADDR = 2, TARGET_ADDR = 1, to prove point-to-point
-// comms before building out real mesh routing on top of this.
 const NETWORK_ID: u16 = 18;
 const NODE_ADDR: u16 = 1;
 const TARGET_ADDR: u16 = 2;
