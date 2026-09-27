@@ -15,7 +15,7 @@ const BUF_SIZE = 256;
 const TX_PIN: c_int = 43;
 const RX_PIN: c_int = 44;
 
-const NETWORK_ID: u16 = 18;
+const NETWORK_ID: u16 = 5;
 const NODE_ADDR: u16 = 1;
 const TARGET_ADDR: u16 = 2;
 const HEARTBEAT_PERIOD_MS: u32 = 2000;
@@ -110,26 +110,25 @@ fn main() callconv(.c) void {
 
     log.info("Node {} ready, heartbeating to {}", .{ NODE_ADDR, TARGET_ADDR });
 
-    var heartbeat_count: u32 = 0;
+    var heartbeat_count: u8 = 0;
 
     while (true) {
-        heartbeat_count += 1;
+        heartbeat_count +%= 1;
 
-        var msg_buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(
-            &msg_buf,
-            "ping #{} from {}",
-            .{ heartbeat_count, NODE_ADDR },
-        ) catch {
-            log.err("Failed to format heartbeat!!!", .{});
+        var msg_buf: [16]u8 = undefined;
+
+        msg_buf[0] = @truncate(TARGET_ADDR >> 8);
+        msg_buf[1] = @truncate(TARGET_ADDR);
+        msg_buf[2] = heartbeat_count;
+
+        const msg = msg_buf[0..3];
+
+        rylr896.sendData(TARGET_ADDR, msg) catch |e| {
+            log.err("send data failed: {any}", .{e});
             continue;
         };
 
-        rylr896.sendString(TARGET_ADDR, msg) catch |e| {
-            log.err("sendString failed: {any}", .{e});
-            continue;
-        };
-        log.info("Sent: {s}", .{msg});
+        log.info("Sent: {x}", .{msg});
     }
 }
 

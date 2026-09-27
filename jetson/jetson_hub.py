@@ -79,7 +79,7 @@ def main():
         radio.send_command("AT")
         radio.send_command("AT+RESET", delay=1.0)
         radio.send_command("AT+ADDRESS=2")
-        radio.send_command("AT+NETWORKID=18")
+        radio.send_command("AT+NETWORKID=5")
         radio.send_command("AT+ADDRESS?")
         radio.send_command("AT+NETWORKID?")
 
