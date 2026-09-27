@@ -35,47 +35,75 @@ class RYLR896:
 
 
     def _try_parse_buffer(self):
-        if not self._buffer:
+        buf = self._buffer
+        if not buf:
             return False
 
-        header_match = self.RCV_HEADER.match(self._buffer)
-        if header_match:
-            length = int(header_match.group(2))
-            payload_start = header_match.end()
-            payload_end = payload_start + length
-
-            if len(self._buffer) < payload_end:
+        if not buf.startswith(b"+RCV="):
+            newline_idx = buf.find(b"\r\n")
+            if newline_idx == -1:
                 return False
-
-            raw_data = bytes(self._buffer[payload_start:payload_end])
-
-            footer_match = self.RCV_FOOTER.match(self._buffer, payload_end)
-            if not footer_match:
-                if b"\r\n" not in self._buffer[payload_end:]:
-                    return False
-                del self._buffer[:payload_end]
-                print(f"Malformed +RCV footer after header: {header_match.group(0)!r}")
-                return True
-
-            address = int(header_match.group(1))
-            rssi = int(footer_match.group(1))
-            snr = int(footer_match.group(2))
-
-            del self._buffer[:footer_match.end()]
-            self._dispatch_message(address, length, raw_data, rssi, snr)
+            line = bytes(buf[:newline_idx])
+            del buf[:newline_idx + 2]
+            text = line.decode(errors="replace").strip()
+            if text:
+                print(f"Module: {text}")
             return True
 
-        newline_idx = self._buffer.find(b"\r\n")
-        if newline_idx == -1:
+        prefix_len = len(b"+RCV=")
+
+        addr_comma = buf.find(b",", prefix_len)
+        if addr_comma == -1:
             return False
 
-        line = bytes(self._buffer[:newline_idx])
-        del self._buffer[:newline_idx + 2]
+        len_comma = buf.find(b",", addr_comma + 1)
+        if len_comma == -1:
+            return False
 
-        text = line.decode(errors="replace").strip()
-        if text:
-            print(f"Module: {text}")
+        try:
+            address = int(buf[prefix_len:addr_comma])
+            length = int(buf[addr_comma + 1:len_comma])
+        except ValueError:
+            del buf[:prefix_len]
+            print("Malformed +RCV header, resyncing")
+            return True
+
+        payload_start = len_comma + 1
+        payload_end = payload_start + length
+        if len(buf) < payload_end:
+            return False
+
+        raw_data = bytes(buf[payload_start:payload_end])
+
+        if buf[payload_end:payload_end + 1] != b",":
+            del buf[:payload_end]
+            print("Malformed +RCV footer (missing comma after payload)")
+            return True
+
+        rssi_start = payload_end + 1
+        rssi_comma = buf.find(b",", rssi_start)
+        if rssi_comma == -1:
+            return False
+
+        snr_start = rssi_comma + 1
+        line_end = buf.find(b"\r\n", snr_start)
+        if line_end == -1:
+            return False
+
+        try:
+            rssi = int(buf[rssi_start:rssi_comma])
+            snr = int(buf[snr_start:line_end])
+        except ValueError:
+            del buf[:line_end + 2]
+            print("Malformed rssi/snr in +RCV footer, resyncing")
+            return True
+
+        consumed_end = line_end + 2
+        del buf[:consumed_end]
+
+        self._dispatch_message(address, length, raw_data, rssi, snr)
         return True
+
 
     def _dispatch_message(self, address, length, raw_data, rssi, snr):
         message = {
