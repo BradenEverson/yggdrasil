@@ -78,12 +78,12 @@ def main():
     try:
         radio.send_command("AT")
         radio.send_command("AT+RESET", delay=1.0)
-        radio.send_command("AT+ADDRESS=1")
-        radio.send_command("AT+NETWORKID=5")
+        radio.send_command("AT+ADDRESS=2")
+        radio.send_command("AT+NETWORKID=18")
         radio.send_command("AT+ADDRESS?")
         radio.send_command("AT+NETWORKID?")
 
-        print("Listening for incoming messages... (Ctrl+C to stop)")
+        print("Listening for incoming messages...")
         while True:
             radio.poll()
             time.sleep(0.05)
