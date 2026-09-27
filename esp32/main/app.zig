@@ -119,9 +119,11 @@ fn main() callconv(.c) void {
 
         msg_buf[0] = @truncate(TARGET_ADDR >> 8);
         msg_buf[1] = @truncate(TARGET_ADDR);
-        msg_buf[2] = heartbeat_count;
+        msg_buf[2] = '\r';
+        msg_buf[3] = '\n';
+        msg_buf[4] = heartbeat_count;
 
-        const msg = msg_buf[0..3];
+        const msg = msg_buf[0..5];
 
         rylr896.sendData(TARGET_ADDR, msg) catch |e| {
             log.err("send data failed: {any}", .{e});
