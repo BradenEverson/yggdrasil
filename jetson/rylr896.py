@@ -1,5 +1,4 @@
 import serial
-import re
 import time
 
 class RYLR896:
