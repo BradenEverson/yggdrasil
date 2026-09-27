@@ -109,8 +109,8 @@ class RYLR896:
             "rssi": rssi,
             "snr": snr,
         }
-        print(f"Received from {message['address']}: {message['data']!r} "
-              f"(RSSI {message['rssi']}, SNR {message['snr']})")
+        print(f"Received from {message["address"]}: {message["data"]!r} "
+              f"(RSSI {message["rssi"]}, SNR {message["snr"]})")
         if self.on_receive:
             try:
                 self.on_receive(message)
@@ -122,7 +122,7 @@ class RYLR896:
             data_bytes = data.encode()
         else:
             data_bytes = data
-        cmd = f'AT+SEND={address},{len(data_bytes)},'.encode() + data_bytes
+        cmd = f"AT+SEND={address},{len(data_bytes)},".encode() + data_bytes
         self.ser.write(cmd + b"\r\n")
         print(f"Sending: {cmd!r}")
 
