@@ -49,4 +49,23 @@ test "get crcs I need" {
 
     const nack = [_]u8{ 0x72, 0x02, 0x00, 0x01, 0x00 };
     try std.testing.expectEqual(0x8B38, getCRC(&nack));
+
+    const network_packet = [_]u8{
+        0x72,
+
+        0x00,
+        0x01,
+
+        0x00,
+        0x02,
+
+        0x00,
+        0x01,
+
+        0b1100_0000,
+
+        0x00,
+        0x00,
+    };
+    try std.testing.expectEqual(0x2CD8, getCRC(&network_packet));
 }
