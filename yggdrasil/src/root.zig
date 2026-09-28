@@ -93,7 +93,6 @@ pub const Yggdrasil = struct {
             .awaiting_header => {
                 if (byte == NetworkPacket.HEADER) {
                     ygg.state = .awaiting_from_msb;
-                    ygg.cursor = 1;
                 }
             },
 
