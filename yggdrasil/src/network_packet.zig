@@ -1,40 +1,15 @@
 //! Raw Packet structure
 
 const std = @import("std");
-pub const CRC = @import("packet/crc.zig");
-
-pub const Opcode = enum(u8) {
-    nop,
-    ack,
-    nack,
-};
-
-pub fn payloadSize(comptime op: Opcode) comptime_int {
-    return switch (op) {
-        .nop => 0,
-        .ack => 4,
-        .nack => 1,
-    };
-}
-
-pub const PACKET_COUNT = 3;
-
-pub fn largestPayload() comptime_int {
-    var max: comptime_int = 0;
-
-    comptime for (0..PACKET_COUNT) |i| {
-        const size = payloadSize(@enumFromInt(i));
-        if (size > max) {
-            max = size;
-        }
-    };
-
-    return max;
-}
+pub const CRC = @import("network_packet/crc.zig");
 
 pub const HEADER: u8 = 0x72;
 
-op: Opcode = .nop,
+from: u16 = 0,
+to: u16 = 0,
+sn: u16 = 0,
+ack: bool = false,
+broadcast: bool = false,
 len: u16 = 0,
 payload: []const u8 = undefined,
 crc: ?u16 = null,
@@ -42,6 +17,7 @@ crc: ?u16 = null,
 const Packet = @This();
 
 pub fn toBuffer(self: *const Packet, buf: []u8) []u8 {
+    // TODO!
     buf[0] = HEADER;
     buf[1] = @intFromEnum(self.op);
 
@@ -70,5 +46,5 @@ pub fn toBuffer(self: *const Packet, buf: []u8) []u8 {
 }
 
 test {
-    _ = @import("packet/crc.zig");
+    _ = @import("network_packet/crc.zig");
 }

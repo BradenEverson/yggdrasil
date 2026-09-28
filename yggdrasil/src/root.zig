@@ -2,21 +2,29 @@
 
 const std = @import("std");
 
-pub const Packet = @import("packet.zig");
-pub const Opcode = Packet.Opcode;
-pub const Message = @import("message.zig");
+pub const NetworkPacket = @import("network_packet.zig");
+pub const AppPacket = @import("app_packet.zig");
 
 /// Errors that are common to most APIs and
 /// communication methods
 pub const YggdrasilError = error{};
-const LARGEST_PACKET_SIZE: usize = 1 + 1 + 2 + Packet.largestPayload() + 2;
+const LARGEST_PACKET_SIZE: usize = 240;
 
 /// The states we can be in while reading
 /// from the incoming stream
 pub const ParseState = enum {
     awaiting_header,
 
-    awaiting_opcode,
+    awaiting_from_msb,
+    awaiting_from_lsb,
+
+    awaiting_to_msb,
+    awaiting_to_lsb,
+
+    awaiting_sn_msb,
+    awaiting_sn_lsb,
+
+    awaiting_flags,
 
     awaiting_len_msb,
     awaiting_len_lsb,
@@ -43,60 +51,54 @@ pub const Yggdrasil = struct {
     buffer: []u8 = undefined,
     packet_buffer: [LARGEST_PACKET_SIZE]u8 = undefined,
 
-    result_cb: *const fn (packet: Packet) void,
-    failure_cb: ?*const fn (reason: Message.NackReason) void = null,
+    result_cb: *const fn (packet: AppPacket) void,
 
-    building_packet: Packet = .{},
+    building_packet: NetworkPacket = .{},
 
     pub fn readStream(ygg: *Yggdrasil) YggdrasilError!void {
         const bytes = try ygg.read_bytes_fn(ygg.buffer);
 
         for (bytes) |byte| {
             if (ygg.readByte(byte)) |packet| {
-                if (Packet.CRC.validateCRC(
+                if (NetworkPacket.CRC.validateCRC(
                     ygg.packet_buffer[0 .. ygg.building_packet.payload.len + 4],
                     ygg.building_packet.crc.?,
                 )) {
-                    ygg.result_cb(packet);
+                    // TODO: handle network packet
+                    _ = packet;
                 } else {
 
                     // Call error callback!
-                    if (ygg.failure_cb) |failure_cb|
-                        failure_cb(.checksum_mismatch);
+                    // if (ygg.failure_cb) |failure_cb|
+                    //     failure_cb(.checksum_mismatch);
 
-                    // Send a NACK too
-                    ygg.packet_buffer[0] = 0x00; // malformed packet nack
-                    const nack = Packet{
-                        .op = .nack,
-                        .len = 1,
-                        .payload = ygg.packet_buffer[0..1],
-                        .crc = null,
-                    };
-
-                    const nack_packet = nack.toBuffer(&ygg.packet_buffer);
-                    try ygg.write_bytes_fn(nack_packet);
+                    // TODO Send a NACK too
+                    // const nack = NetworkPacket{};
+                    //
+                    // const nack_packet = nack.toBuffer(&ygg.packet_buffer);
+                    // try ygg.write_bytes_fn(nack_packet);
                 }
             }
         }
     }
 
-    pub fn readByte(ygg: *Yggdrasil, byte: u8) ?Packet {
+    pub fn readByte(ygg: *Yggdrasil, byte: u8) ?NetworkPacket {
         switch (ygg.state) {
             .awaiting_header => {
-                if (byte == Packet.HEADER) {
-                    ygg.state = .awaiting_opcode;
+                if (byte == NetworkPacket.HEADER) {
+                    ygg.state = .awaiting_from_msb;
                     ygg.packet_buffer[0] = byte;
                 }
             },
-            .awaiting_opcode => {
-                if (byte < Packet.PACKET_COUNT) {
-                    ygg.building_packet.op = @enumFromInt(byte);
-                    ygg.state = .awaiting_len_msb;
-                    ygg.packet_buffer[1] = byte;
-                } else {
-                    ygg.state = .awaiting_header;
-                }
-            },
+
+            // TODO: read from
+
+            // TODO: read to
+
+            // TODO: read sn
+
+            // TODO: read flags
+
             .awaiting_len_msb => {
                 ygg.building_packet.len = 0;
                 ygg.building_packet.len |= byte;
@@ -138,6 +140,8 @@ pub const Yggdrasil = struct {
                 ygg.state = .awaiting_header;
                 return ygg.building_packet;
             },
+
+            else => {},
         }
 
         return null;
@@ -145,8 +149,8 @@ pub const Yggdrasil = struct {
 };
 
 test {
-    _ = @import("packet.zig");
-    _ = @import("message.zig");
+    _ = @import("network_packet.zig");
+    _ = @import("app_packet.zig");
 }
 
 fn nopRead(buf: []u8) YggdrasilError![]u8 {
@@ -181,13 +185,8 @@ fn emptyWrite(buf: []u8) YggdrasilError!void {
     _ = buf;
 }
 
-fn yay(packet: Packet) void {
+fn yay(packet: AppPacket) void {
     std.debug.print("{any}\n", .{packet});
-}
-
-test {
-    _ = @import("packet.zig");
-    _ = @import("message.zig");
 }
 
 test "Simple packet parsing" {
