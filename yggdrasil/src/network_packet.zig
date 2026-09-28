@@ -8,6 +8,7 @@ pub const HEADER: u8 = 0x72;
 const ACK_BIT: u8 = 7;
 const BROADCAST_BIT: u8 = 6;
 const NACK_BIT: u8 = 5;
+const SLEEP_BIT: u8 = 4;
 
 from: u16 = 0,
 to: u16 = 0,
@@ -15,6 +16,7 @@ sn: u16 = 0,
 ack: bool = false,
 broadcast: bool = false,
 nack: bool = false,
+sleep: bool = false,
 len: u16 = 0,
 payload: []const u8 = undefined,
 crc: ?u16 = null,
@@ -25,6 +27,7 @@ pub fn parseFlags(self: *Packet, flags: u8) void {
     self.ack = (flags >> ACK_BIT) & 0x1 == 0x1;
     self.broadcast = (flags >> BROADCAST_BIT) & 0x1 == 0x1;
     self.nack = (flags >> NACK_BIT) & 0x1 == 0x1;
+    self.sleep = (flags >> SLEEP_BIT) & 0x1 == 0x1;
 }
 
 pub fn toBuffer(self: *const Packet, buf: []u8) []u8 {

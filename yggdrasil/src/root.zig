@@ -53,7 +53,7 @@ pub const Yggdrasil = struct {
     buffer: []u8 = undefined,
     packet_buffer: [LARGEST_PACKET_SIZE]u8 = undefined,
 
-    result_cb: *const fn (packet: AppPacket) void,
+    result_cb: *const fn (packet: NetworkPacket) void,
 
     building_packet: NetworkPacket = .{},
 
@@ -62,15 +62,12 @@ pub const Yggdrasil = struct {
 
         for (bytes) |byte| {
             if (ygg.readByte(byte)) |packet| {
-                std.debug.print("Packet received\n", .{});
                 if (NetworkPacket.CRC.validateCRC(
                     ygg.packet_buffer[0 .. ygg.building_packet.payload.len + NETWORK_HEADER_LEN - 2],
                     ygg.building_packet.crc.?,
                 )) {
-                    std.debug.print("CRC good\n{any}\n", .{packet});
-                    // TODO: handle network packet
+                    ygg.result_cb(packet);
                 } else {
-                    std.debug.print("CRC Failed\n", .{});
                     // Call error callback!
                     // if (ygg.failure_cb) |failure_cb|
                     //     failure_cb(.checksum_mismatch);
@@ -223,7 +220,7 @@ fn emptyWrite(buf: []u8) YggdrasilError!void {
     _ = buf;
 }
 
-fn yay(packet: AppPacket) void {
+fn yay(packet: NetworkPacket) void {
     std.debug.print("{any}\n", .{packet});
 }
 
