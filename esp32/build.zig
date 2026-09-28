@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) !void {
     });
     obj.root_module.addImport("esp_idf", idf_wrapped_modules(b));
 
+    const yggdrasil = b.dependency("yggdrasil", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    obj.root_module.addImport("yggdrasil", yggdrasil.module("yggdrasil"));
+
     const obj_install = b.addInstallArtifact(obj, .{
         .dest_dir = .{
             .override = .{

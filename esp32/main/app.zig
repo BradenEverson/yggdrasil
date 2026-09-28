@@ -6,6 +6,8 @@ const ver = idf.ver.Version;
 const sys = idf.sys;
 const mem = std.mem;
 
+const yggdrasil = @import("yggdrasil");
+
 const Rylr896 = @import("rylr896.zig");
 
 const UART_PORT: c_uint = 1; // UART1
