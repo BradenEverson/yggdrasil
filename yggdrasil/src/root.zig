@@ -69,14 +69,11 @@ pub const Yggdrasil = struct {
                     ygg.result_cb(packet);
                 } else {
                     // Call error callback!
-                    // if (ygg.failure_cb) |failure_cb|
-                    //     failure_cb(.checksum_mismatch);
-
-                    // TODO Send a NACK too
-                    // const nack = NetworkPacket{};
-                    //
-                    // const nack_packet = nack.toBuffer(&ygg.packet_buffer);
-                    // try ygg.write_bytes_fn(nack_packet);
+                    // The application from here can choose
+                    // to send a nack, shouldn't be our decision
+                    // here
+                    if (ygg.failure_cb) |failure_cb|
+                        failure_cb(.checksum_mismatch);
                 }
             }
         }
