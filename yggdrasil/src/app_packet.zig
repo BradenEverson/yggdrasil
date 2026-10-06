@@ -128,7 +128,7 @@ pub const Value = union(ValueType) {
                 return .{ .uint64 = uint64 };
             },
 
-            .int8 => return .{ .uint8 = @bitCast(buf[0]) },
+            .int8 => return .{ .int8 = @bitCast(buf[0]) },
             .int16 => {
                 var uint16: u16 = 0;
 
@@ -136,7 +136,7 @@ pub const Value = union(ValueType) {
                 uint16 <<= 8;
                 uint16 |= buf[1];
 
-                return .{ .uint16 = @bitCast(uint16) };
+                return .{ .int16 = @bitCast(uint16) };
             },
             .int32 => {
                 var uint32: u32 = 0;
@@ -149,7 +149,7 @@ pub const Value = union(ValueType) {
                 uint32 <<= 8;
                 uint32 |= buf[3];
 
-                return .{ .uint32 = @bitCast(uint32) };
+                return .{ .int32 = @bitCast(uint32) };
             },
             .int64 => {
                 var uint64: u64 = 0;
@@ -170,7 +170,7 @@ pub const Value = union(ValueType) {
                 uint64 <<= 8;
                 uint64 |= buf[7];
 
-                return .{ .uint64 = @bitCast(uint64) };
+                return .{ .int64 = @bitCast(uint64) };
             },
 
             .float32 => {
@@ -241,16 +241,34 @@ test "Sensor stream" {
         0xAD,
         0xBE,
         0xEF,
+        8, // len
+        4, // reading type: i8
+        'n', // name
+        'u',
+        'm',
+        'b',
+        'e',
+        'r',
+        0xFF, // val
     };
 
     var streamer = SensorReadingStream{
         .buf = &sensor_data,
     };
 
-    const packet = streamer.next().?;
-    const expected: SensorEntry = .{
+    var packet = streamer.next().?;
+    var expected: SensorEntry = .{
         .name = "test",
         .value = .{ .uint32 = 0xDEADBEEF },
+    };
+
+    try std.testing.expectEqualSlices(u8, expected.name, packet.name);
+    try std.testing.expectEqual(expected.value, packet.value);
+
+    packet = streamer.next().?;
+    expected = .{
+        .name = "number",
+        .value = .{ .int8 = -1 },
     };
 
     try std.testing.expectEqualSlices(u8, expected.name, packet.name);
