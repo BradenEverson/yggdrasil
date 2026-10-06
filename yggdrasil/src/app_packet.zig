@@ -231,6 +231,7 @@ test "Value parsing" {
 
 test "Sensor stream" {
     const sensor_data = [_]u8{
+        // First Packet
         9, // len
         2, // reading type: u32
         't', // Name
@@ -241,6 +242,8 @@ test "Sensor stream" {
         0xAD,
         0xBE,
         0xEF,
+
+        // Second Packet
         8, // len
         4, // reading type: i8
         'n', // name
@@ -250,6 +253,10 @@ test "Sensor stream" {
         'e',
         'r',
         0xFF, // val
+
+        // Unfinished packet, should return null
+        100,
+        0,
     };
 
     var streamer = SensorReadingStream{
@@ -273,4 +280,6 @@ test "Sensor stream" {
 
     try std.testing.expectEqualSlices(u8, expected.name, packet.name);
     try std.testing.expectEqual(expected.value, packet.value);
+
+    try std.testing.expectEqual(null, streamer.next());
 }
