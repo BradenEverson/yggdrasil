@@ -68,12 +68,11 @@ pub const Yggdrasil = struct {
                 )) {
                     ygg.result_cb(packet);
                 } else {
+                    // TODO!!!!!!!!!!!!
                     // Call error callback!
-                    // The application from here can choose
-                    // to send a nack, shouldn't be our decision
-                    // here
-                    if (ygg.failure_cb) |failure_cb|
-                        failure_cb(.checksum_mismatch);
+                    // The application from here can
+                    // choose to send a nack, shouldn't
+                    // be our decision here
                 }
             }
         }
