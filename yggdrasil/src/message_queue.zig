@@ -11,10 +11,5 @@ pub const MAX_NEIGHBORS: usize = 64;
 /// are popped from the mq btw ;)
 pub const MAX_MESSAGE_QUEUE_LENGTH: usize = 16;
 
-pub const Priority = enum(usize) {
-    /// Data readings, non-important messages
-    low,
-    /// Important system level messages
-    /// (node disconnect, sleep notification, etc)
-    high,
-};
+pub const PRIORITY_LOW: usize = 10;
+pub const PRIORITY_HIGH: usize = 0;
