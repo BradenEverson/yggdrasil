@@ -16,5 +16,5 @@ pub const PRIORITY_HIGH: usize = 0;
 
 test {
     _ = @import("message_queue/tree.zig");
-    _ = @import("message_queue/heap.zig");
+    _ = @import("message_queue/priority_queue.zig");
 }
