@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const NetworkPacket = @import("network_packet.zig");
 pub const AppPacket = @import("app_packet.zig");
+pub const MessageQueue = @import("message_queue.zig");
 
 /// Errors that are common to most APIs and
 /// communication methods
@@ -47,6 +48,8 @@ pub const Yggdrasil = struct {
     read_bytes_fn: *const fn (buf: []u8) YggdrasilError![]u8,
     write_bytes_fn: *const fn (buf: []u8) YggdrasilError!void,
 
+    outgoing_packets: MessageQueue = .{},
+
     state: ParseState = .awaiting_header,
     cursor: usize = 0,
 
@@ -70,6 +73,7 @@ pub const Yggdrasil = struct {
                 } else {
                     // TODO!!!!!!!!!!!!
                     // Call error callback!
+                    //
                     // The application from here can
                     // choose to send a nack, shouldn't
                     // be our decision here
