@@ -16,23 +16,19 @@ pub const SensorReadingStream = struct {
     pub fn next(stream: *SensorReadingStream) ?SensorEntry {
         // Must have at least the space for length and the
         // reading type
-        if (stream.buf.len < 3)
+        if (stream.buf.len < 2)
             return null;
 
-        const len_msb = stream.buf[0];
-        const len_lsb = stream.buf[1];
+        const len = stream.buf[0];
 
-        var len: u16 = 0;
-        len |= len_msb;
-        len <<= 8;
-        len |= len_lsb;
+        stream.buf = stream.buf[1..];
 
         if (stream.buf.len < len)
             return null;
 
-        const val_type: ValueType = @enumFromInt(stream.buf[2]);
+        const val_type: ValueType = @enumFromInt(stream.buf[0]);
 
-        stream.buf = stream.buf[3..];
+        stream.buf = stream.buf[1..];
 
         const name_len = len - 1 - val_type.byteCount();
 
@@ -235,8 +231,7 @@ test "Value parsing" {
 
 test "Sensor stream" {
     const sensor_data = [_]u8{
-        0, // len msb
-        9, // len lsb
+        9, // len
         2, // reading type: u32
         't', // Name
         'e',
