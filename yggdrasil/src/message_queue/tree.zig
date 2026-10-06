@@ -1,3 +1,6 @@
+//! A binary tree with a fixed size array as it's backing structure
+//! To be used as the backing structure of our priority queuing mechanism
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
