@@ -13,3 +13,8 @@ pub const MAX_MESSAGE_QUEUE_LENGTH: usize = 16;
 
 pub const PRIORITY_LOW: usize = 10;
 pub const PRIORITY_HIGH: usize = 0;
+
+test {
+    _ = @import("message_queue/tree.zig");
+    _ = @import("message_queue/heap.zig");
+}
