@@ -11,8 +11,7 @@ op: Opcode = .nop,
 payload: []const u8 = undefined,
 
 pub const SensorReadingStream = struct {
-    buf: []u8,
-    cursor: usize = 0,
+    buf: []const u8,
 
     pub fn next(stream: *SensorReadingStream) ?SensorEntry {
         // Must have at least the space for length and the
@@ -24,29 +23,31 @@ pub const SensorReadingStream = struct {
         const len_lsb = stream.buf[1];
 
         var len: u16 = 0;
-        len |= len_msb << 8;
-        len |= len_lsb << 0;
+        len |= len_msb;
+        len <<= 8;
+        len |= len_lsb;
+
+        if (stream.buf.len < len)
+            return null;
 
         const val_type: ValueType = @enumFromInt(stream.buf[2]);
-        _ = val_type;
 
         stream.buf = stream.buf[3..];
 
-        const name_len_msb = stream.buf[0];
-        const name_len_lsb = stream.buf[1];
-
-        var name_len: u16 = 0;
-        name_len |= name_len_msb << 8;
-        name_len |= name_len_lsb << 0;
-
-        stream.buf = stream.buf[2..];
+        const name_len = len - 1 - val_type.byteCount();
 
         const name = stream.buf[0..name_len];
-        _ = name;
 
         stream.buf = stream.buf[name_len..];
 
-        return null;
+        const value = Value.fromBytes(val_type, stream.buf);
+
+        stream.buf = stream.buf[val_type.byteCount()..];
+
+        return .{
+            .name = name,
+            .value = value,
+        };
     }
 };
 
@@ -61,6 +62,15 @@ pub const ValueType = enum(u8) {
     int64,
     float32,
     float64,
+
+    pub fn byteCount(val: ValueType) usize {
+        return switch (val) {
+            .uint8, .int8 => 1,
+            .uint16, .int16 => 2,
+            .uint32, .int32, .float32 => 4,
+            .uint64, .int64, .float64 => 8,
+        };
+    }
 };
 
 pub const Value = union(ValueType) {
@@ -206,9 +216,7 @@ pub const Value = union(ValueType) {
 };
 
 pub const SensorEntry = struct {
-    len: u16,
-    name: []u8,
-    val_type: ValueType,
+    name: []const u8,
     value: Value,
 };
 
@@ -223,4 +231,33 @@ test "Value parsing" {
 
     const resf32 = Value.fromBytes(.float32, &buf);
     try std.testing.expectEqual(-6.259853398707798e+18, resf32.float32);
+}
+
+test "Sensor stream" {
+    const sensor_data = [_]u8{
+        0, // len msb
+        9, // len lsb
+        2, // reading type: u32
+        't', // Name
+        'e',
+        's',
+        't',
+        0xDE, // Value
+        0xAD,
+        0xBE,
+        0xEF,
+    };
+
+    var streamer = SensorReadingStream{
+        .buf = &sensor_data,
+    };
+
+    const packet = streamer.next().?;
+    const expected: SensorEntry = .{
+        .name = "test",
+        .value = .{ .uint32 = 0xDEADBEEF },
+    };
+
+    try std.testing.expectEqualSlices(u8, expected.name, packet.name);
+    try std.testing.expectEqual(expected.value, packet.value);
 }
