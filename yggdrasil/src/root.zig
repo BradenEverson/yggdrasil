@@ -187,10 +187,6 @@ fn nopRead(buf: []u8) YggdrasilError![]u8 {
     return buf[0..9];
 }
 
-fn emptyWrite(buf: []u8) YggdrasilError!void {
-    _ = buf;
-}
-
 test "Simple packet parsing" {
     var buffer: [64]u8 = undefined;
 
@@ -201,11 +197,15 @@ test "Simple packet parsing" {
             _ = packet;
             seen = true;
         }
+
+        fn emptyWrite(buf: []u8) YggdrasilError!void {
+            _ = buf;
+        }
     };
 
     var ygg = Yggdrasil{
         .read_bytes_fn = nopRead,
-        .write_bytes_fn = emptyWrite,
+        .write_bytes_fn = Runtime.emptyWrite,
         .result_cb = Runtime.packetEvent,
         .buffer = &buffer,
     };
