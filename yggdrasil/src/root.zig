@@ -168,13 +168,7 @@ test "Simple packet parsing" {
         }
 
         fn read(buf: []u8) YggdrasilError![]u8 {
-            var nop = NetworkPacket{
-                .from = 1,
-                .to = 2,
-                .len = 0,
-                .ack = true,
-                .broadcast = true,
-            };
+            var nop = NetworkPacket{};
 
             const packet = nop.toBuffer(buf);
 
