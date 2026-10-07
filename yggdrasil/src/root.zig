@@ -56,6 +56,16 @@ pub const Yggdrasil = struct {
 
     building_packet: NetworkPacket = .{},
 
+    /// Call whenever it is time for an outgoing message to be sent
+    /// This could be periodic, constantly, legit whatever. Uses a round robin
+    /// scheduling mechanism to wrap around all neighbors' message queues
+    pub fn requestWrite(ygg: *Yggdrasil) YggdrasilError!void {
+        _ = ygg;
+    }
+
+    /// Superloop that will constantly poll the provided read function and feed it to
+    /// a state machine for parsing out Yggdrasil packets. Performs a quick verification
+    /// of the CRC, and if successful passes the message to the callback :D
     pub fn readStream(ygg: *Yggdrasil) YggdrasilError!void {
         const bytes = try ygg.read_bytes_fn(ygg.buffer);
 
