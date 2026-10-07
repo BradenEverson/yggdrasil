@@ -68,7 +68,7 @@ pub fn toBuffer(self: *Packet, buf: []u8) []u8 {
     @memcpy(buf[7 .. 7 + self.len], self.payload[0..self.len]);
 
     if (self.crc == null)
-        self.crc = CRC.getCRC(buf[0..self.len]);
+        self.crc = CRC.getCRC(buf[0 .. 7 + self.len]);
 
     buf[7 + self.len + 0] = @truncate(self.crc.? >> 8);
     buf[7 + self.len + 1] = @truncate(self.crc.? >> 0);
@@ -115,8 +115,8 @@ test "to buffer" {
         // We keep crc as null, so this enforces that
         // writing to buffer with a null crc first
         // calculates the crc
-        0x0E,
-        0xA8,
+        0x46,
+        0xE8,
     };
 
     try std.testing.expectEqualSlices(u8, &expected, packet_buf);

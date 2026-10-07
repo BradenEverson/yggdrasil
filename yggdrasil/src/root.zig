@@ -156,37 +156,6 @@ test {
     _ = @import("app_packet.zig");
 }
 
-fn nopRead(buf: []u8) YggdrasilError![]u8 {
-    const nop = [9]u8{
-        0x72,
-
-        0x00,
-        0x01,
-
-        0x00,
-        0x02,
-
-        0b1100_0000,
-
-        0x00,
-
-        0x0B,
-        0x40,
-    };
-
-    buf[0] = nop[0];
-    buf[1] = nop[1];
-    buf[2] = nop[2];
-    buf[3] = nop[3];
-    buf[4] = nop[4];
-    buf[5] = nop[5];
-    buf[6] = nop[6];
-    buf[7] = nop[7];
-    buf[8] = nop[8];
-
-    return buf[0..9];
-}
-
 test "Simple packet parsing" {
     var buffer: [64]u8 = undefined;
 
@@ -198,14 +167,28 @@ test "Simple packet parsing" {
             seen = true;
         }
 
-        fn emptyWrite(buf: []u8) YggdrasilError!void {
+        fn read(buf: []u8) YggdrasilError![]u8 {
+            var nop = NetworkPacket{
+                .from = 1,
+                .to = 2,
+                .len = 0,
+                .ack = true,
+                .broadcast = true,
+            };
+
+            const packet = nop.toBuffer(buf);
+
+            return packet;
+        }
+
+        fn write(buf: []u8) YggdrasilError!void {
             _ = buf;
         }
     };
 
     var ygg = Yggdrasil{
-        .read_bytes_fn = nopRead,
-        .write_bytes_fn = Runtime.emptyWrite,
+        .read_bytes_fn = Runtime.read,
+        .write_bytes_fn = Runtime.write,
         .result_cb = Runtime.packetEvent,
         .buffer = &buffer,
     };
