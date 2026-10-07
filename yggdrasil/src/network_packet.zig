@@ -35,33 +35,91 @@ pub fn parseFlags(self: *Packet, flags: u8) void {
     self.nesn = (flags >> NESN_BIT) & 0x1 == 0x1;
 }
 
-pub fn toBuffer(self: *const Packet, buf: []u8) []u8 {
-    // TODO!
+fn flagByte(self: *const Packet) u8 {
+    var flag: u8 = 0;
+
+    if (self.ack)
+        flag |= 1 << ACK_BIT;
+    if (self.broadcast)
+        flag |= 1 << BROADCAST_BIT;
+    if (self.nack)
+        flag |= 1 << NACK_BIT;
+    if (self.sn)
+        flag |= 1 << SN_BIT;
+    if (self.nesn)
+        flag |= 1 << NESN_BIT;
+
+    return flag;
+}
+
+pub fn toBuffer(self: *Packet, buf: []u8) []u8 {
     buf[0] = HEADER;
-    buf[1] = @intFromEnum(self.op);
 
-    const len_msb: u8 = @truncate(self.len >> 8);
-    const len_lsb: u8 = @truncate(self.len >> 0);
+    buf[1] = @truncate(self.from >> 8);
+    buf[2] = @truncate(self.from >> 0);
 
-    buf[2] = len_msb;
-    buf[3] = len_lsb;
+    buf[3] = @truncate(self.to >> 8);
+    buf[4] = @truncate(self.to >> 0);
 
-    for (self.payload, 0..) |byte, i| {
-        buf[4 + i] = byte;
-    }
+    buf[5] = self.flagByte();
 
-    const crc = if (self.crc) |crc|
-        crc
-    else
-        CRC.getCRC(buf[0..self.payload.len]);
+    buf[6] = self.len;
 
-    const crc_msb: u8 = @truncate(crc >> 8);
-    const crc_lsb: u8 = @truncate(crc >> 0);
+    @memcpy(buf[7 .. 7 + self.len], self.payload[0..self.len]);
 
-    buf[4 + self.payload.len + 0] = crc_msb;
-    buf[4 + self.payload.len + 1] = crc_lsb;
+    if (self.crc == null)
+        self.crc = CRC.getCRC(buf[0..self.len]);
 
-    return buf[0 .. 4 + self.payload.len + 2];
+    buf[7 + self.len + 0] = @truncate(self.crc.? >> 8);
+    buf[7 + self.len + 1] = @truncate(self.crc.? >> 0);
+
+    return buf[0 .. 7 + self.len + 2];
+}
+
+test "to buffer" {
+    var buf: [64]u8 = undefined;
+
+    var p = Packet{
+        .from = 0xDEAD,
+        .to = 0xBEEF,
+
+        .ack = false,
+        .broadcast = true,
+        .nack = false,
+        .sn = false,
+        .nesn = true,
+
+        .len = 2,
+    };
+    p.payload[0] = 0xBE;
+    p.payload[1] = 0xAD;
+
+    const packet_buf = p.toBuffer(&buf);
+
+    const expected = [_]u8{
+        0x72,
+
+        0xDE,
+        0xAD,
+
+        0xBE,
+        0xEF,
+
+        0x48,
+
+        0x02,
+
+        0xBE,
+        0xAD,
+
+        // We keep crc as null, so this enforces that
+        // writing to buffer with a null crc first
+        // calculates the crc
+        0x0E,
+        0xA8,
+    };
+
+    try std.testing.expectEqualSlices(u8, &expected, packet_buf);
 }
 
 test {
