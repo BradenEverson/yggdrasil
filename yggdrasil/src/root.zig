@@ -11,7 +11,7 @@ pub const MessageQueue = @import("message_queue.zig");
 pub const YggdrasilError = error{};
 const LARGEST_PACKET_SIZE: usize = 240;
 
-const NETWORK_HEADER_LEN: usize = 12;
+const NETWORK_HEADER_LEN: usize = 7;
 
 /// The states we can be in while reading
 /// from the incoming stream
@@ -24,13 +24,9 @@ pub const ParseState = enum {
     awaiting_to_msb,
     awaiting_to_lsb,
 
-    awaiting_sn_msb,
-    awaiting_sn_lsb,
-
     awaiting_flags,
 
-    awaiting_len_msb,
-    awaiting_len_lsb,
+    awaiting_len,
 
     reading_payload,
 
@@ -66,7 +62,7 @@ pub const Yggdrasil = struct {
         for (bytes) |byte| {
             if (ygg.readByte(byte)) |packet| {
                 if (NetworkPacket.CRC.validateCRC(
-                    ygg.packet_buffer[0 .. ygg.building_packet.payload.len + NETWORK_HEADER_LEN - 2],
+                    ygg.packet_buffer[0 .. ygg.building_packet.len + NETWORK_HEADER_LEN],
                     ygg.building_packet.crc.?,
                 )) {
                     ygg.result_cb(packet);
@@ -112,44 +108,26 @@ pub const Yggdrasil = struct {
             },
             .awaiting_to_lsb => {
                 ygg.building_packet.to |= byte;
-                ygg.state = .awaiting_sn_msb;
-            },
-
-            .awaiting_sn_msb => {
-                ygg.building_packet.sn = 0;
-                ygg.building_packet.sn |= byte;
-                ygg.building_packet.sn <<= 8;
-                ygg.state = .awaiting_sn_lsb;
-            },
-            .awaiting_sn_lsb => {
-                ygg.building_packet.sn |= byte;
                 ygg.state = .awaiting_flags;
             },
 
             .awaiting_flags => {
                 ygg.building_packet.parseFlags(byte);
-                ygg.state = .awaiting_len_msb;
+                ygg.state = .awaiting_len;
             },
 
-            .awaiting_len_msb => {
-                ygg.building_packet.len = 0;
-                ygg.building_packet.len |= byte;
-                ygg.building_packet.len <<= 8;
-                ygg.state = .awaiting_len_lsb;
-            },
-            .awaiting_len_lsb => {
-                ygg.building_packet.len |= byte;
+            .awaiting_len => {
+                ygg.building_packet.len = byte;
 
                 if (ygg.building_packet.len == 0) {
-                    ygg.building_packet.payload = ygg.packet_buffer[NETWORK_HEADER_LEN..NETWORK_HEADER_LEN];
                     ygg.state = .awaiting_crc_msb;
                 } else {
                     ygg.state = .reading_payload;
                 }
             },
             .reading_payload => {
+                ygg.building_packet.payload[ygg.cursor - NETWORK_HEADER_LEN] = byte;
                 if (ygg.cursor == ygg.building_packet.len + NETWORK_HEADER_LEN) {
-                    ygg.building_packet.payload = ygg.packet_buffer[NETWORK_HEADER_LEN .. NETWORK_HEADER_LEN + ygg.building_packet.len];
                     ygg.state = .awaiting_crc_msb;
                 }
             },
@@ -179,7 +157,7 @@ test {
 }
 
 fn nopRead(buf: []u8) YggdrasilError![]u8 {
-    const nop = [12]u8{
+    const nop = [9]u8{
         0x72,
 
         0x00,
@@ -188,16 +166,12 @@ fn nopRead(buf: []u8) YggdrasilError![]u8 {
         0x00,
         0x02,
 
-        0x00,
-        0x01,
-
         0b1100_0000,
 
         0x00,
-        0x00,
 
-        0x2C,
-        0xD8,
+        0x0B,
+        0x40,
     };
 
     buf[0] = nop[0];
@@ -209,11 +183,8 @@ fn nopRead(buf: []u8) YggdrasilError![]u8 {
     buf[6] = nop[6];
     buf[7] = nop[7];
     buf[8] = nop[8];
-    buf[9] = nop[9];
-    buf[10] = nop[10];
-    buf[11] = nop[11];
 
-    return buf[0..12];
+    return buf[0..9];
 }
 
 fn emptyWrite(buf: []u8) YggdrasilError!void {
@@ -221,7 +192,8 @@ fn emptyWrite(buf: []u8) YggdrasilError!void {
 }
 
 fn yay(packet: NetworkPacket) void {
-    std.debug.print("{any}\n", .{packet});
+    _ = packet;
+    std.debug.print("Packet Received!\n", .{});
 }
 
 test "Simple packet parsing" {

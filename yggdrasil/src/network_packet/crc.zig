@@ -59,13 +59,9 @@ test "get crcs I need" {
         0x00,
         0x02,
 
-        0x00,
-        0x01,
-
         0b1100_0000,
 
         0x00,
-        0x00,
     };
-    try std.testing.expectEqual(0x2CD8, getCRC(&network_packet));
+    try std.testing.expectEqual(0x0B40, getCRC(&network_packet));
 }
