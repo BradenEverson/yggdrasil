@@ -191,20 +191,25 @@ fn emptyWrite(buf: []u8) YggdrasilError!void {
     _ = buf;
 }
 
-fn yay(packet: NetworkPacket) void {
-    _ = packet;
-    std.debug.print("Packet Received!\n", .{});
-}
-
 test "Simple packet parsing" {
     var buffer: [64]u8 = undefined;
+
+    const Runtime = struct {
+        var seen: bool = false;
+
+        fn packetEvent(packet: NetworkPacket) void {
+            _ = packet;
+            seen = true;
+        }
+    };
 
     var ygg = Yggdrasil{
         .read_bytes_fn = nopRead,
         .write_bytes_fn = emptyWrite,
-        .result_cb = yay,
+        .result_cb = Runtime.packetEvent,
         .buffer = &buffer,
     };
 
     try ygg.readStream();
+    try std.testing.expect(Runtime.seen);
 }
