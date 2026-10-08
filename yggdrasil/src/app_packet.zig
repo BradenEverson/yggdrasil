@@ -13,6 +13,15 @@ pub const Opcode = enum(u8) {
     /// This also helps other nodes learn routing
     /// to this new node!
     hello,
+    /// Signify that the sender is a root that data should
+    /// be streamed to
+    im_a_root,
+    /// Message from a root to enable a device's stream
+    /// of sensor data. Sender payload will include a
+    /// minimum latency the root would like, an ack will
+    /// tell the original sender what the selected frequency
+    /// of stream was
+    configure_stream,
     /// A list of all connections that the source
     /// node has with all other nodes it can see
     ///
