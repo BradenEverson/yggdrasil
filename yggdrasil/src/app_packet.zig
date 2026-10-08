@@ -3,11 +3,27 @@
 const std = @import("std");
 
 pub const Opcode = enum(u8) {
-    nop,
+    /// Message sent by a node who just woke up
+    /// All neighbors that can hear the message
+    /// will reply with an ack. This helps the
+    /// node learn it's neighbors immediately
+    /// before then being able to request topology
+    /// information
+    ///
+    /// This also helps other nodes learn routing
+    /// to this new node!
+    hello,
+    /// A list of all connections that the source
+    /// node has with all other nodes it can see
+    ///
+    /// Used for creating the routing table
+    topology_info,
+    /// The true application level data, a collection of
+    /// sensor readings from this node to a central hub
     sensor_readings,
 };
 
-op: Opcode = .nop,
+op: Opcode = .hello,
 payload: []const u8 = undefined,
 
 pub const SensorReadingStream = struct {
