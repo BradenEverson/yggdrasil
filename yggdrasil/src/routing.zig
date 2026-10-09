@@ -55,13 +55,13 @@ pub const TopologyGraph = struct {
 };
 
 pub const ForwardingEntry = struct {
-    to: u16,
     mq_idk: usize,
+    to: u16,
 };
 
 pub const MessageQueueMap = struct {
-    addr: u16,
     mq_idx: usize,
+    addr: u16,
 };
 
 pub const ForwardingTable = struct {
