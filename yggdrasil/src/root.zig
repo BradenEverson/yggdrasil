@@ -6,6 +6,9 @@ pub const NetworkPacket = @import("network_packet.zig");
 pub const AppPacket = @import("app_packet.zig");
 pub const MessageQueue = @import("message_queue.zig");
 
+pub const routing = @import("routing.zig");
+pub const ForwardingTable = routing.ForwardingTable;
+
 /// Errors that are common to most APIs and
 /// communication methods
 pub const YggdrasilError = error{};
@@ -47,6 +50,7 @@ pub const Yggdrasil = struct {
     address: u16 = 0,
 
     outgoing_packets: MessageQueue = .{},
+    forwarding_table: ForwardingTable = .{},
 
     state: ParseState = .awaiting_header,
     cursor: usize = 0,
@@ -163,11 +167,6 @@ pub const Yggdrasil = struct {
     }
 };
 
-test {
-    _ = @import("network_packet.zig");
-    _ = @import("app_packet.zig");
-}
-
 test "Simple packet parsing" {
     var buffer: [64]u8 = undefined;
 
@@ -201,4 +200,12 @@ test "Simple packet parsing" {
 
     try ygg.readStream();
     try std.testing.expect(Runtime.seen);
+}
+
+test {
+    _ = @import("network_packet.zig");
+    _ = @import("app_packet.zig");
+    _ = @import("routing.zig");
+    _ = @import("message_queue.zig");
+    _ = @import("python.zig");
 }
