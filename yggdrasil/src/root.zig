@@ -44,6 +44,8 @@ pub const Yggdrasil = struct {
     read_bytes_fn: *const fn (buf: []u8) YggdrasilError![]u8,
     write_bytes_fn: *const fn (buf: []u8) YggdrasilError!void,
 
+    address: u16 = 0,
+
     outgoing_packets: MessageQueue = .{},
 
     state: ParseState = .awaiting_header,
