@@ -18,6 +18,10 @@ pub fn PriorityQueue(comptime T: type, comptime MAX_ELEMS: usize) type {
 
         const Heap = @This();
 
+        pub fn isEmpty(mh: *const Heap) bool {
+            return mh.tree.size == 0;
+        }
+
         pub fn minHeapify(mh: *Heap, i: usize) void {
             if (i >= (mh.tree.size / 2))
                 return;

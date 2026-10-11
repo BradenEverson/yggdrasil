@@ -21,6 +21,35 @@ pub const PRIORITY_HIGH: usize = 0;
 
 slots: [MAX_NEIGHBORS]PriorityQueue(NetworkPacket, MAX_MESSAGE_QUEUE_LENGTH) = undefined,
 registered_nodes: usize = 0,
+cursor: usize = 0,
+
+const MessageQueue = @This();
+
+pub fn pushMessage(mq: *MessageQueue, slot: usize, msg: NetworkPacket, priority: usize) !void {
+    try mq.slots[slot].push(msg, priority);
+}
+
+pub fn allEmpty(mq: *const MessageQueue) bool {
+    for (0..mq.registered_nodes) |i| {
+        if (!mq.slots[i].isEmpty())
+            return false;
+    }
+
+    return true;
+}
+
+/// Walks all slots until a valid message is found
+pub fn roundRobinPop(mq: *MessageQueue) ?NetworkPacket {
+    if (mq.allEmpty())
+        return null;
+
+    while (mq.slots[mq.cursor].isEmpty())
+        mq.cursor += 1;
+
+    defer mq.cursor += 1;
+
+    return mq.slots[mq.cursor].pop();
+}
 
 test {
     _ = @import("message_queue/tree.zig");
