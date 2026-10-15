@@ -156,10 +156,9 @@ fn main() callconv(.c) void {
 
             rylr896.sendData(TARGET_ADDR, msg) catch |e| {
                 log.err("send data failed: {any}", .{e});
-                continue;
             };
 
-            idf.rtos.Task.delayMs(5000);
+            idf.rtos.Task.delayMs(30000);
         } else |e| {
             log.err("send data failed: {any}", .{e});
         }
