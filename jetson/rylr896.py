@@ -108,8 +108,8 @@ class RYLR896:
             "rssi": rssi,
             "snr": snr,
         }
-        print(f"Received from {message["address"]}: {message["data"]!r} "
-              f"(RSSI {message["rssi"]}, SNR {message["snr"]})")
+        print(f"Received from {message['address']}: {message['data']!r} "
+              f"(RSSI {message['rssi']}, SNR {message['snr']})")
         if self.on_receive:
             try:
                 self.on_receive(message)
