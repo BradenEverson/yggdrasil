@@ -7,6 +7,7 @@ const sys = idf.sys;
 const mem = std.mem;
 
 const yggdrasil = @import("yggdrasil");
+const bme688 = @import("bme688.zig");
 
 const Rylr896 = @import("rylr896.zig");
 
@@ -25,6 +26,15 @@ const HEARTBEAT_PERIOD_MS: u32 = 2000;
 comptime {
     @export(&main, .{ .name = "app_main" });
 }
+
+const SDA_PIN = 20;
+const SCL_PIN = 21;
+
+extern fn shim_i2c_new_bus(
+    sda: c_int,
+    scl: c_int,
+    out: *sys.i2c_master_bus_handle_t,
+) sys.esp_err_t;
 
 pub fn setPin(port: c_uint, pins: struct {
     tx: c_int = sys.UART_PIN_NO_CHANGE,
@@ -51,6 +61,18 @@ fn main() callconv(.c) void {
         .rx_buffer = &rx_buf,
         .tx_buffer = &tx_buf,
     };
+
+    var bus: sys.i2c_master_bus_handle_t = null;
+    if (shim_i2c_new_bus(SDA_PIN, SCL_PIN, &bus) != 0) {
+        log.err("I2C bus init failed", .{});
+        return;
+    }
+
+    var sensor = bme688.Bme688.init(bus, bme688.ADDR_HIGH, 100_000, .{}) catch |e| {
+        log.err("BME688 init failed: {s}", .{@errorName(e)});
+        return;
+    };
+    defer sensor.deinit();
 
     var heap = idf.heap.HeapCapsAllocator.init(.{ .@"8bit" = true });
     var arena = std.heap.ArenaAllocator.init(heap.allocator());
@@ -112,27 +134,35 @@ fn main() callconv(.c) void {
 
     log.info("Node {} ready, heartbeating to {}", .{ NODE_ADDR, TARGET_ADDR });
 
-    var heartbeat_count: u8 = 0;
-
     while (true) {
-        heartbeat_count +%= 1;
+        if (sensor.measure()) |r| {
+            const gas_ok = r.gas_valid and r.heater_stable;
 
-        var msg_buf: [16]u8 = undefined;
+            const pressure: u16 = @intFromFloat(std.math.clamp(r.pressureHpa() * 10.0, 0, 65535));
+            const temp: i16 = @intFromFloat(std.math.clamp(r.temperatureF() * 100.0, -32768, 32767));
+            const hum: u16 = @intFromFloat(std.math.clamp(r.humidity_pct * 100.0, 0, 10000));
+            const gas: u32 = if (gas_ok)
+                @intFromFloat(std.math.clamp(r.gas_resistance_ohm, 0, 4_294_967_040))
+            else
+                0;
 
-        msg_buf[0] = @truncate(TARGET_ADDR >> 8);
-        msg_buf[1] = @truncate(TARGET_ADDR);
-        msg_buf[2] = '\r';
-        msg_buf[3] = '\n';
-        msg_buf[4] = heartbeat_count;
+            var msg_buf: [10]u8 = undefined;
+            std.mem.writeInt(u16, msg_buf[0..2], pressure, .big);
+            std.mem.writeInt(i16, msg_buf[2..4], temp, .big);
+            std.mem.writeInt(u16, msg_buf[4..6], hum, .big);
+            std.mem.writeInt(u32, msg_buf[6..10], gas, .big);
 
-        const msg = msg_buf[0..5];
+            const msg = msg_buf[0..];
 
-        rylr896.sendData(TARGET_ADDR, msg) catch |e| {
+            rylr896.sendData(TARGET_ADDR, msg) catch |e| {
+                log.err("send data failed: {any}", .{e});
+                continue;
+            };
+
+            idf.rtos.Task.delayMs(5000);
+        } else |e| {
             log.err("send data failed: {any}", .{e});
-            continue;
-        };
-
-        log.info("Sent: {x}", .{msg});
+        }
     }
 }
 
