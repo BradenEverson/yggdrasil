@@ -27,7 +27,7 @@ def handle_message(message):
 
     gas = f"{r['gas_ohm']} ohm" if r["gas_ohm"] is not None else "n/a"
     print(
-        f"From: {message['address']}: "
+        f"From Node {message['address']}: "
         f"Pressure={r['pressure_hpa']:.1f} hPa  "
         f"Temp={r['temperature_f']:.2f} F  "
         f"Humidity={r['humidity_pct']:.2f}%  "
