@@ -153,7 +153,7 @@ fn main() callconv(.c) void {
             std.mem.writeInt(u32, msg_buf[6..10], gas, .big);
 
             // TODO: get power from INA260
-            std.mem.writeInt(u16, msg_buf[10..12], 0xDEADBEEF, .big);
+            std.mem.writeInt(u16, msg_buf[10..12], 0xBEEF, .big);
 
             const msg = msg_buf[0..];
 
