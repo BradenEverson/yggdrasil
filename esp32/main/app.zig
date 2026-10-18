@@ -146,11 +146,14 @@ fn main() callconv(.c) void {
             else
                 0;
 
-            var msg_buf: [10]u8 = undefined;
+            var msg_buf: [12]u8 = undefined;
             std.mem.writeInt(u16, msg_buf[0..2], pressure, .big);
             std.mem.writeInt(i16, msg_buf[2..4], temp, .big);
             std.mem.writeInt(u16, msg_buf[4..6], hum, .big);
             std.mem.writeInt(u32, msg_buf[6..10], gas, .big);
+
+            // TODO: get power from INA260
+            std.mem.writeInt(u16, msg_buf[10..12], 0xDEADBEEF, .big);
 
             const msg = msg_buf[0..];
 

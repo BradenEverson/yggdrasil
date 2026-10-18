@@ -2,20 +2,21 @@ import struct
 import time
 from rylr896 import RYLR896
 
-PAYLOAD_FORMAT = ">HhHI"
+PAYLOAD_FORMAT = ">HhHIH"
 PAYLOAD_SIZE = struct.calcsize(PAYLOAD_FORMAT)
 
 def parse_payload(data: bytes):
     if len(data) != PAYLOAD_SIZE:
         raise ValueError(f"expected {PAYLOAD_SIZE} bytes, got {len(data)}")
 
-    pressure_raw, temp_raw, hum_raw, gas_raw = struct.unpack(PAYLOAD_FORMAT, data)
+    pressure_raw, temp_raw, hum_raw, gas_raw, power_mw = struct.unpack(PAYLOAD_FORMAT, data)
 
     return {
         "pressure_hpa": pressure_raw / 10.0,
         "temperature_f": temp_raw / 100.0,
         "humidity_pct": hum_raw / 100.0,
         "gas_ohm": gas_raw if gas_raw != 0 else None,
+        "power": power_mw,
     }
 
 def handle_message(message):
@@ -31,7 +32,8 @@ def handle_message(message):
         f"Pressure={r['pressure_hpa']:.1f} hPa  "
         f"Temp={r['temperature_f']:.2f} F  "
         f"Humidity={r['humidity_pct']:.2f}%  "
-        f"Gas Resistance={gas}"
+        f"Gas Resistance={gas}  "
+        f"Power={r['power']} mW"
     )
 
 
