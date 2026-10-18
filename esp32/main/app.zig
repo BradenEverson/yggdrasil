@@ -8,6 +8,7 @@ const mem = std.mem;
 
 const yggdrasil = @import("yggdrasil");
 const bme688 = @import("bme688.zig");
+const ina260 = @import("ina260.zig");
 
 const Rylr896 = @import("rylr896.zig");
 
@@ -73,6 +74,12 @@ fn main() callconv(.c) void {
         return;
     };
     defer sensor.deinit();
+
+    var power_sensor = ina260.Ina260.init(bus, ina260.ADDR_DEFAULT, 100_000, .x16) catch |e| {
+        log.err("INA260 init failed: {s}", .{@errorName(e)});
+        return;
+    };
+    defer power_sensor.deinit();
 
     var heap = idf.heap.HeapCapsAllocator.init(.{ .@"8bit" = true });
     var arena = std.heap.ArenaAllocator.init(heap.allocator());
@@ -152,8 +159,13 @@ fn main() callconv(.c) void {
             std.mem.writeInt(u16, msg_buf[4..6], hum, .big);
             std.mem.writeInt(u32, msg_buf[6..10], gas, .big);
 
-            // TODO: get power from INA260
-            std.mem.writeInt(u16, msg_buf[10..12], 0xBEEF, .big);
+            const power_mw: u16 = if (power_sensor.readPowerMw()) |mw|
+                @intCast(@min(mw, std.math.maxInt(u16)))
+            else |e| blk: {
+                log.err("INA260 read failed: {s}", .{@errorName(e)});
+                break :blk 0;
+            };
+            std.mem.writeInt(u16, msg_buf[10..12], power_mw, .big);
 
             const msg = msg_buf[0..];
 
