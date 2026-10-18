@@ -1,9 +1,37 @@
+import csv
+import os
 import struct
 import time
+from datetime import datetime
+
 from rylr896 import RYLR896
 
 PAYLOAD_FORMAT = ">HhHIH"
 PAYLOAD_SIZE = struct.calcsize(PAYLOAD_FORMAT)
+
+CSV_PATH = "log.csv"
+CSV_FIELDS = [
+    "timestamp",
+    "node_address",
+    "pressure_hpa",
+    "temperature_f",
+    "humidity_pct",
+    "gas_ohm",
+    "power_mw",
+]
+
+csv_file = None
+csv_writer = None
+
+def open_csv(path):
+    needs_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    f = open(path, "a", newline="")
+    writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+    if needs_header:
+        writer.writeheader()
+        f.flush()
+    return f, writer
+
 
 def parse_payload(data: bytes):
     if len(data) != PAYLOAD_SIZE:
@@ -18,6 +46,21 @@ def parse_payload(data: bytes):
         "gas_ohm": gas_raw if gas_raw != 0 else None,
         "power": power_mw,
     }
+
+
+def log_to_csv(address, r):
+    csv_writer.writerow({
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "node_address": address,
+        "pressure_hpa": r["pressure_hpa"],
+        "temperature_f": r["temperature_f"],
+        "humidity_pct": r["humidity_pct"],
+        "gas_ohm": "" if r["gas_ohm"] is None else r["gas_ohm"],
+        "power_mw": r["power"],
+    })
+    csv_file.flush()
+    os.fsync(csv_file.fileno())
+
 
 def handle_message(message):
     try:
@@ -36,9 +79,16 @@ def handle_message(message):
         f"Power={r['power']} mW"
     )
 
+    log_to_csv(message["address"], r)
+
 
 def main():
+    global csv_file, csv_writer
+
     print("Jetson Nano Runner!")
+
+    csv_file, csv_writer = open_csv(CSV_PATH)
+    print(f"Logging to {os.path.abspath(CSV_PATH)}")
 
     radio = RYLR896()
     radio.on_receive = handle_message
@@ -60,6 +110,7 @@ def main():
         print("\nShutting down.")
     finally:
         radio.close()
+        csv_file.close()
 
 
 if __name__ == "__main__":
