@@ -207,5 +207,4 @@ test {
     _ = @import("app_packet.zig");
     _ = @import("routing.zig");
     _ = @import("message_queue.zig");
-    _ = @import("python.zig");
 }

@@ -16,16 +16,16 @@ pub const MAX_MESSAGE_QUEUE_LENGTH: usize = 16;
 
 const MessageSlots = [MAX_NEIGHBORS]PriorityQueue(NetworkPacket, MAX_MESSAGE_QUEUE_LENGTH);
 
-pub const PRIORITY_LOW: usize = 10;
-pub const PRIORITY_HIGH: usize = 0;
+pub const PRIORITY_LOW: u8 = 10;
+pub const PRIORITY_HIGH: u8 = 0;
 
-slots: [MAX_NEIGHBORS]PriorityQueue(NetworkPacket, MAX_MESSAGE_QUEUE_LENGTH) = undefined,
+slots: MessageSlots = @splat(.{}),
 registered_nodes: usize = 0,
 cursor: usize = 0,
 
 const MessageQueue = @This();
 
-pub fn pushMessage(mq: *MessageQueue, slot: usize, msg: NetworkPacket, priority: usize) !void {
+pub fn pushMessage(mq: *MessageQueue, slot: usize, msg: NetworkPacket, priority: u8) !void {
     try mq.slots[slot].push(msg, priority);
 }
 
@@ -43,10 +43,13 @@ pub fn roundRobinPop(mq: *MessageQueue) ?NetworkPacket {
     if (mq.allEmpty())
         return null;
 
-    while (mq.slots[mq.cursor].isEmpty())
-        mq.cursor += 1;
+    if (mq.cursor >= mq.registered_nodes)
+        mq.cursor = 0;
 
-    defer mq.cursor += 1;
+    while (mq.slots[mq.cursor].isEmpty())
+        mq.cursor = (mq.cursor + 1) % mq.registered_nodes;
+
+    defer mq.cursor = (mq.cursor + 1) % mq.registered_nodes;
 
     return mq.slots[mq.cursor].pop();
 }

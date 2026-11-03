@@ -113,6 +113,38 @@ pub fn build(b: *std.Build) void {
     // command itself, like this: `zig build run -- arg1 arg2 etc`
     run_cmd.addPassthruArgs();
 
+    const wasm_enabled = b.option(bool, "wasm", "Install the WebAssembly bindings with the default step") orelse false;
+    const wasm_optimize = b.option(
+        std.lang.Optimize,
+        "wasm-optimize",
+        "Optimize mode for the wasm bindings (default safe so panics are reported)",
+    ) orelse .safe;
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+
+    const wasm_exe = b.addExecutable(.{
+        .name = "yggdrasil",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm.zig"),
+            .target = wasm_target,
+            .optimize = wasm_optimize,
+            .imports = &.{
+                .{ .name = "yggdrasil", .module = b.createModule(.{
+                    .root_source_file = b.path("src/root.zig"),
+                    .target = wasm_target,
+                    .optimize = wasm_optimize,
+                }) },
+            },
+        }),
+    });
+    wasm_exe.entry = .disabled;
+    wasm_exe.rdynamic = true;
+
+    const install_wasm = b.addInstallArtifact(wasm_exe, .{});
+    const wasm_step = b.step("wasm", "Build the WebAssembly bindings");
+    wasm_step.dependOn(&install_wasm.step);
+    if (wasm_enabled) b.getInstallStep().dependOn(&install_wasm.step);
+    b.addNamedLazyPath("wasm", wasm_exe.getEmittedBin());
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
