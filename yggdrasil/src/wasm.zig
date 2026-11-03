@@ -146,7 +146,15 @@ export fn ygg_read_stream(h: u32) i32 {
 
 export fn ygg_request_write(h: u32) i32 {
     const node = enter(h) orelse return -1;
-    node.ygg.requestWrite() catch return 1;
+    const wrote = node.ygg.requestWrite() catch return -2;
+    if (wrote) node.stats.shim_transmits += 1;
+    return @intFromBool(wrote);
+}
+
+export fn ygg_register_neighbor(h: u32, address: u16, slot: u32) i32 {
+    const node = get(h) orelse return -1;
+    if (slot >= MessageQueue.MAX_NEIGHBORS) return 2;
+    _ = node.ygg.forwarding_table.registerNeighbor(address, slot) catch return 1;
     return 0;
 }
 
@@ -177,14 +185,7 @@ export fn ygg_enqueue(
 }
 
 export fn ygg_shim_transmit_next(h: u32) i32 {
-    const node = enter(h) orelse return -1;
-    var packet = node.ygg.outgoing_packets.roundRobinPop() orelse return 0;
-
-    var buf: [300]u8 = undefined;
-    const bytes = packet.toBuffer(&buf);
-    node.ygg.write_bytes_fn(bytes) catch return -2;
-    node.stats.shim_transmits += 1;
-    return 1;
+    return ygg_request_write(h);
 }
 
 export fn ygg_transmit_raw(
@@ -279,11 +280,13 @@ fn writeSnapshot(w: *Writer, node: *Node) Writer.Error!void {
     var first = true;
     for (&mq.slots, 0..) |*pq, i| {
         const size = pq.tree.size;
-        if (size == 0 and i >= mq.registered_nodes) continue;
+        if (size == 0 and mq.tx_buffers[i] == null and i >= mq.registered_nodes) continue;
         if (!first) try w.writeAll(",");
         first = false;
 
-        try w.print("{{\"index\":{d},\"size\":{d},\"entries\":[", .{ i, size });
+        try w.print("{{\"index\":{d},\"size\":{d},\"tx_buffer\":", .{ i, size });
+        if (mq.tx_buffers[i]) |*tx| try writePacket(w, tx) else try w.writeAll("null");
+        try w.writeAll(",\"entries\":[");
         for (pq.tree.ar[0..@min(size, pq.tree.ar.len)], 0..) |*entry, j| {
             if (j != 0) try w.writeAll(",");
             try w.print("{{\"priority\":{d},\"packet\":", .{entry.priority});

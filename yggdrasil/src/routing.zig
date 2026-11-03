@@ -55,19 +55,53 @@ pub const TopologyGraph = struct {
 };
 
 pub const ForwardingEntry = struct {
-    mq_idk: usize,
-    to: u16,
+    mq_idk: usize = 0,
+    to: u16 = 0,
 };
 
 pub const MessageQueueMap = struct {
-    mq_idx: usize,
-    addr: u16,
+    mq_idx: usize = 0,
+    addr: u16 = 0,
+    sn: bool = false,
+    nesn: bool = false,
+    ack_pending: bool = false,
 };
 
 pub const ForwardingTable = struct {
-    output_map: [MAX_NEIGHBORS]MessageQueueMap = undefined,
+    output_map: [MAX_NEIGHBORS]MessageQueueMap = @splat(.{}),
     num_registered_output_map: usize = 0,
 
-    forwarding_table: [MAX_NEIGHBORS]ForwardingEntry = undefined,
+    forwarding_table: [MAX_NEIGHBORS]ForwardingEntry = @splat(.{}),
     num_forwards: usize = 0,
+
+    pub const Error = error{TooManyNeighbors};
+
+    pub fn registerNeighbor(ft: *ForwardingTable, addr: u16, mq_idx: usize) Error!*MessageQueueMap {
+        if (ft.neighborByAddr(addr)) |existing| {
+            existing.mq_idx = mq_idx;
+            return existing;
+        }
+
+        if (ft.num_registered_output_map >= MAX_NEIGHBORS)
+            return error.TooManyNeighbors;
+
+        const entry = &ft.output_map[ft.num_registered_output_map];
+        entry.* = .{ .addr = addr, .mq_idx = mq_idx };
+        ft.num_registered_output_map += 1;
+        return entry;
+    }
+
+    pub fn neighborByAddr(ft: *ForwardingTable, addr: u16) ?*MessageQueueMap {
+        for (ft.output_map[0..ft.num_registered_output_map]) |*entry| {
+            if (entry.addr == addr) return entry;
+        }
+        return null;
+    }
+
+    pub fn neighborBySlot(ft: *ForwardingTable, mq_idx: usize) ?*MessageQueueMap {
+        for (ft.output_map[0..ft.num_registered_output_map]) |*entry| {
+            if (entry.mq_idx == mq_idx) return entry;
+        }
+        return null;
+    }
 };

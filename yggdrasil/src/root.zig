@@ -7,12 +7,16 @@ pub const AppPacket = @import("app_packet.zig");
 pub const MessageQueue = @import("message_queue.zig");
 
 pub const routing = @import("routing.zig");
+pub const link_layer = @import("link_layer.zig");
 pub const ForwardingTable = routing.ForwardingTable;
 
 /// Errors that are common to most APIs and
 /// communication methods
 pub const YggdrasilError = error{};
 const LARGEST_PACKET_SIZE: usize = 240;
+
+/// Scratch space for serializing an outgoing packet: header + max payload + crc
+const TX_BUFFER_SIZE: usize = 256;
 
 const NETWORK_HEADER_LEN: usize = 7;
 
@@ -62,11 +66,73 @@ pub const Yggdrasil = struct {
 
     building_packet: NetworkPacket = .{},
 
-    /// Call whenever it is time for an outgoing message to be sent
-    /// This could be periodic, constantly, legit whatever. Uses a round robin
     /// scheduling mechanism to wrap around all neighbors' message queues
-    pub fn requestWrite(ygg: *Yggdrasil) YggdrasilError!void {
-        _ = ygg;
+    pub fn requestWrite(ygg: *Yggdrasil) YggdrasilError!bool {
+        const mq = &ygg.outgoing_packets;
+        const ft = &ygg.forwarding_table;
+
+        for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
+            if (!neighbor.ack_pending or mq.txBuffer(neighbor.mq_idx) != null)
+                continue;
+
+            var ack = NetworkPacket{
+                .from = ygg.address,
+                .to = neighbor.addr,
+                .sn = neighbor.sn,
+                .nesn = neighbor.nesn,
+            };
+            neighbor.ack_pending = false;
+            try ygg.writePacket(&ack);
+            return true;
+        }
+
+        const slot = mq.roundRobinTx() orelse return false;
+        const packet = mq.txBuffer(slot).?;
+
+        const neighbor = if (packet.broadcast) null else ft.neighborBySlot(slot);
+        if (neighbor) |n| {
+            packet.sn = n.sn;
+            packet.nesn = n.nesn;
+            n.ack_pending = false;
+        }
+
+        try ygg.writePacket(packet);
+
+        if (neighbor == null)
+            mq.ackTxBuffer(slot);
+
+        return true;
+    }
+
+    fn writePacket(ygg: *Yggdrasil, packet: *NetworkPacket) YggdrasilError!void {
+        var buf: [TX_BUFFER_SIZE]u8 = undefined;
+        packet.crc = null;
+        try ygg.write_bytes_fn(packet.toBuffer(&buf));
+    }
+
+    /// Handles network level packets that are relevant to routing tables, forwarding,
+    /// etc. Passes through most (maybe all?) messages to the app level callback as well
+    pub fn handle_network_packet(ygg: *Yggdrasil, packet: NetworkPacket) void {
+        if (ygg.address == packet.to) {
+            // Message is for us, need to verify at the link layer level if
+            // our last message was sent and if this is a new packet
+
+            if (ygg.forwarding_table.neighborByAddr(packet.from)) |neighbor| {
+                if (link_layer.isLinkOnly(&packet)) {
+                    link_layer.processAck(ygg, neighbor, packet.nesn);
+                    return;
+                }
+
+                if (!link_layer.linkLayerProcess(ygg, neighbor, packet.sn, packet.nesn))
+                    return;
+            }
+
+            ygg.result_cb(packet);
+        } else if (packet.broadcast) {
+            // Broadcast packets do not carry link layer information, since they are sent to everybody!
+        } else {
+            // Packet was forwarded to us along a route, check if we can carry on the routing
+        }
     }
 
     /// Superloop that will constantly poll the provided read function and feed it to
@@ -81,7 +147,7 @@ pub const Yggdrasil = struct {
                     ygg.packet_buffer[0 .. ygg.building_packet.len + NETWORK_HEADER_LEN],
                     ygg.building_packet.crc.?,
                 )) {
-                    ygg.result_cb(packet);
+                    ygg.handle_network_packet(packet);
                 } else {
                     // TODO!!!!!!!!!!!!
                     // Call error callback!
@@ -207,4 +273,5 @@ test {
     _ = @import("app_packet.zig");
     _ = @import("routing.zig");
     _ = @import("message_queue.zig");
+    _ = @import("link_layer.zig");
 }
