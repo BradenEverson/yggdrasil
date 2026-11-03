@@ -51,7 +51,7 @@ pub const SensorReadingStream = struct {
         if (stream.buf.len < len)
             return null;
 
-        const val_type: ValueType = @enumFromInt(stream.buf[0]);
+        const val_type: ValueType = @fromBackingInt(@intCast(stream.buf[0]));
 
         stream.buf = stream.buf[1..];
 
