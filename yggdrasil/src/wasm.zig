@@ -154,7 +154,45 @@ export fn ygg_request_write(h: u32) i32 {
 export fn ygg_register_neighbor(h: u32, address: u16, slot: u32) i32 {
     const node = get(h) orelse return -1;
     if (slot >= MessageQueue.MAX_NEIGHBORS) return 2;
-    _ = node.ygg.forwarding_table.registerNeighbor(address, slot) catch return 1;
+    _ = node.ygg.registerNeighbor(address, @intCast(slot)) catch return 1;
+    return 0;
+}
+
+export fn ygg_set_route(h: u32, dest: u16, slot: u32) i32 {
+    const node = get(h) orelse return -1;
+    if (slot >= MessageQueue.MAX_NEIGHBORS) return 2;
+    node.ygg.forwarding_table.setRoute(dest, slot) catch return 1;
+    return 0;
+}
+
+export fn ygg_remove_route(h: u32, dest: u16) void {
+    const node = get(h) orelse return;
+    node.ygg.forwarding_table.removeRoute(dest);
+}
+
+export fn ygg_say_hello(h: u32) i32 {
+    const node = enter(h) orelse return -1;
+    node.ygg.sayHello() catch return -2;
+    return 0;
+}
+
+export fn ygg_send(
+    h: u32,
+    dest: u16,
+    payload_ptr: [*]const u8,
+    payload_len: usize,
+    priority: u8,
+) i32 {
+    const node = enter(h) orelse return -1;
+    node.ygg.send(dest, payload_ptr[0..payload_len], priority) catch |err| {
+        node.stats.enqueue_failures += 1;
+        return switch (err) {
+            error.NoRoute => 4,
+            error.PayloadTooLarge => 3,
+            error.TreeFull => 1,
+        };
+    };
+    node.stats.packets_enqueued += 1;
     return 0;
 }
 
@@ -215,15 +253,15 @@ fn buildPacket(node: *Node, to: u16, flags: u8, payload: []const u8) ?NetworkPac
     var packet: NetworkPacket = .{
         .from = node.ygg.address,
         .to = to,
+        .origin = node.ygg.address,
+        .dest = to,
         .ack = flags & FLAG_ACK != 0,
         .broadcast = flags & FLAG_BROADCAST != 0,
         .nack = flags & FLAG_NACK != 0,
         .sn = flags & FLAG_SN != 0,
         .nesn = flags & FLAG_NESN != 0,
     };
-    if (payload.len > packet.payload.len) return null;
-    packet.len = @intCast(payload.len);
-    @memcpy(packet.payload[0..payload.len], payload);
+    packet.setPayload(payload) catch return null;
     return packet;
 }
 
@@ -309,8 +347,8 @@ fn writeSnapshot(w: *Writer, node: *Node) Writer.Error!void {
 
 fn writePacket(w: *Writer, p: *const NetworkPacket) Writer.Error!void {
     try w.print(
-        "{{\"from\":{d},\"to\":{d},\"ack\":{},\"broadcast\":{},\"nack\":{},\"sn\":{},\"nesn\":{},\"len\":{d},\"crc\":",
-        .{ p.from, p.to, p.ack, p.broadcast, p.nack, p.sn, p.nesn, p.len },
+        "{{\"from\":{d},\"to\":{d},\"origin\":{d},\"dest\":{d},\"ack\":{},\"broadcast\":{},\"nack\":{},\"sn\":{},\"nesn\":{},\"len\":{d},\"crc\":",
+        .{ p.from, p.to, p.origin, p.dest, p.ack, p.broadcast, p.nack, p.sn, p.nesn, p.len },
     );
     try writeValue(w, p.crc);
     try w.writeAll(",\"payload\":");

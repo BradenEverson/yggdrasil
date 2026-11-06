@@ -35,6 +35,30 @@ pub const Opcode = enum(u8) {
 op: Opcode = .hello,
 payload: []const u8 = undefined,
 
+const AppPacket = @This();
+
+pub fn parse(bytes: []const u8) ?AppPacket {
+    if (bytes.len == 0)
+        return null;
+
+    const op = std.enums.fromInt(Opcode, bytes[0]) orelse return null;
+
+    return .{
+        .op = op,
+        .payload = bytes[1..],
+    };
+}
+
+pub fn write(app: AppPacket, buf: []u8) error{NoSpaceLeft}![]u8 {
+    if (buf.len < app.payload.len + 1)
+        return error.NoSpaceLeft;
+
+    buf[0] = @backingInt(app.op);
+    @memcpy(buf[1 .. 1 + app.payload.len], app.payload);
+
+    return buf[0 .. 1 + app.payload.len];
+}
+
 pub const SensorReadingStream = struct {
     buf: []const u8,
 
@@ -240,6 +264,18 @@ pub const SensorEntry = struct {
     name: []const u8,
     value: Value,
 };
+
+test "App packet round trip" {
+    var buf: [8]u8 = undefined;
+    const bytes = try (AppPacket{ .op = .topology_info, .payload = &.{ 1, 2 } }).write(&buf);
+
+    const parsed = AppPacket.parse(bytes).?;
+    try std.testing.expectEqual(Opcode.topology_info, parsed.op);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, parsed.payload);
+
+    try std.testing.expect(AppPacket.parse(&.{}) == null);
+    try std.testing.expect(AppPacket.parse(&.{0xFF}) == null);
+}
 
 test "Value parsing" {
     const buf = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };

@@ -19,6 +19,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const yggdrasil = b.dependency("yggdrasil", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    obj.root_module.addImport("yggdrasil", yggdrasil.module("yggdrasil"));
+
     const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "-T", "flash.ld", "-o" });
     const elf_file = ld_cmd.addOutputFileArg("ztm32.elf");
     ld_cmd.addArtifactArg(obj);

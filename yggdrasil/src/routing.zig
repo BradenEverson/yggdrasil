@@ -1,6 +1,8 @@
 //! Routing Implementation, Network Topology graph and forwarding table
 //! defintions
 
+const std = @import("std");
+
 pub const MAX_NEIGHBORS = @import("message_queue.zig").MAX_NEIGHBORS;
 
 pub const Node = struct {
@@ -28,6 +30,7 @@ pub const TopologyGraph = struct {
         var graph = TopologyGraph{};
         graph.slotmap[graph.num_registered] = .{ .address = me };
         graph.num_registered += 1;
+        return graph;
     }
 
     pub fn insert(graph: *TopologyGraph, addr: usize) void {
@@ -55,8 +58,8 @@ pub const TopologyGraph = struct {
 };
 
 pub const ForwardingEntry = struct {
-    mq_idk: usize = 0,
-    to: u16 = 0,
+    mq_idx: usize = 0,
+    dest: u16 = 0,
 };
 
 pub const MessageQueueMap = struct {
@@ -74,7 +77,7 @@ pub const ForwardingTable = struct {
     forwarding_table: [MAX_NEIGHBORS]ForwardingEntry = @splat(.{}),
     num_forwards: usize = 0,
 
-    pub const Error = error{TooManyNeighbors};
+    pub const Error = error{ TooManyNeighbors, TooManyRoutes };
 
     pub fn registerNeighbor(ft: *ForwardingTable, addr: u16, mq_idx: usize) Error!*MessageQueueMap {
         if (ft.neighborByAddr(addr)) |existing| {
@@ -104,4 +107,70 @@ pub const ForwardingTable = struct {
         }
         return null;
     }
+
+    pub fn freeSlot(ft: *ForwardingTable) ?usize {
+        for (0..MAX_NEIGHBORS) |slot| {
+            if (ft.neighborBySlot(slot) == null) return slot;
+        }
+        return null;
+    }
+
+    pub fn setRoute(ft: *ForwardingTable, dest: u16, mq_idx: usize) Error!void {
+        for (ft.forwarding_table[0..ft.num_forwards]) |*entry| {
+            if (entry.dest == dest) {
+                entry.mq_idx = mq_idx;
+                return;
+            }
+        }
+
+        if (ft.num_forwards >= MAX_NEIGHBORS)
+            return error.TooManyRoutes;
+
+        ft.forwarding_table[ft.num_forwards] = .{ .dest = dest, .mq_idx = mq_idx };
+        ft.num_forwards += 1;
+    }
+
+    pub fn removeRoute(ft: *ForwardingTable, dest: u16) void {
+        for (ft.forwarding_table[0..ft.num_forwards], 0..) |entry, i| {
+            if (entry.dest == dest) {
+                ft.num_forwards -= 1;
+                ft.forwarding_table[i] = ft.forwarding_table[ft.num_forwards];
+                return;
+            }
+        }
+    }
+
+    pub fn nextHop(ft: *ForwardingTable, dest: u16) ?*MessageQueueMap {
+        if (ft.neighborByAddr(dest)) |neighbor|
+            return neighbor;
+
+        for (ft.forwarding_table[0..ft.num_forwards]) |entry| {
+            if (entry.dest == dest)
+                return ft.neighborBySlot(entry.mq_idx);
+        }
+
+        return null;
+    }
 };
+
+test "next hop prefers direct neighbors, then forwarding entries" {
+    var ft = ForwardingTable{};
+
+    _ = try ft.registerNeighbor(10, 0);
+    _ = try ft.registerNeighbor(20, 1);
+
+    try std.testing.expectEqual(@as(?usize, 2), ft.freeSlot());
+
+    try ft.setRoute(30, 1);
+    try ft.setRoute(10, 1);
+
+    try std.testing.expectEqual(@as(u16, 10), ft.nextHop(10).?.addr);
+    try std.testing.expectEqual(@as(u16, 20), ft.nextHop(30).?.addr);
+    try std.testing.expect(ft.nextHop(40) == null);
+
+    try ft.setRoute(30, 0);
+    try std.testing.expectEqual(@as(u16, 10), ft.nextHop(30).?.addr);
+
+    ft.removeRoute(30);
+    try std.testing.expect(ft.nextHop(30) == null);
+}

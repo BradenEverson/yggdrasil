@@ -1,4 +1,6 @@
 const std = @import("std");
+const yggdrasil = @import("yggdrasil");
+
 const hal = @import("hal.zig");
 const Rylr = @import("drivers/rylr896.zig");
 const bme688 = @import("drivers/bme688.zig");

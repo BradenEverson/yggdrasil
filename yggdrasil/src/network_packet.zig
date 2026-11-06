@@ -4,6 +4,8 @@ const std = @import("std");
 pub const CRC = @import("network_packet/crc.zig");
 
 pub const HEADER: u8 = 0x72;
+pub const BROADCAST_ADDR: u16 = 0xFFFF;
+pub const HEADER_LEN: usize = 11;
 
 const ACK_BIT: u8 = 7;
 const BROADCAST_BIT: u8 = 6;
@@ -11,11 +13,13 @@ const NACK_BIT: u8 = 5;
 const SN_BIT: u8 = 4;
 const NESN_BIT: u8 = 3;
 
-/// LoRA max - from - to - flags - len - crc
-const MAX_PAYLOAD_SIZE: usize = 240 - 2 - 2 - 1 - 1 - 2;
+/// LoRA max - from - to - origin - dest - flags - len - crc
+pub const MAX_PAYLOAD_SIZE: usize = 240 - 2 - 2 - 2 - 2 - 1 - 1 - 2;
 
 from: u16 = 0,
 to: u16 = 0,
+origin: u16 = 0,
+dest: u16 = 0,
 ack: bool = false,
 broadcast: bool = false,
 nack: bool = false,
@@ -61,19 +65,37 @@ pub fn toBuffer(self: *Packet, buf: []u8) []u8 {
     buf[3] = @truncate(self.to >> 8);
     buf[4] = @truncate(self.to >> 0);
 
-    buf[5] = self.flagByte();
+    buf[5] = @truncate(self.origin >> 8);
+    buf[6] = @truncate(self.origin >> 0);
 
-    buf[6] = self.len;
+    buf[7] = @truncate(self.dest >> 8);
+    buf[8] = @truncate(self.dest >> 0);
 
-    @memcpy(buf[7 .. 7 + self.len], self.payload[0..self.len]);
+    buf[9] = self.flagByte();
+
+    buf[10] = self.len;
+
+    @memcpy(buf[HEADER_LEN .. HEADER_LEN + self.len], self.payload[0..self.len]);
 
     if (self.crc == null)
-        self.crc = CRC.getCRC(buf[0 .. 7 + self.len]);
+        self.crc = CRC.getCRC(buf[0 .. HEADER_LEN + self.len]);
 
-    buf[7 + self.len + 0] = @truncate(self.crc.? >> 8);
-    buf[7 + self.len + 1] = @truncate(self.crc.? >> 0);
+    buf[HEADER_LEN + self.len + 0] = @truncate(self.crc.? >> 8);
+    buf[HEADER_LEN + self.len + 1] = @truncate(self.crc.? >> 0);
 
-    return buf[0 .. 7 + self.len + 2];
+    return buf[0 .. HEADER_LEN + self.len + 2];
+}
+
+pub fn setPayload(self: *Packet, bytes: []const u8) error{PayloadTooLarge}!void {
+    if (bytes.len > MAX_PAYLOAD_SIZE)
+        return error.PayloadTooLarge;
+
+    self.len = @intCast(bytes.len);
+    @memcpy(self.payload[0..bytes.len], bytes);
+}
+
+pub fn body(self: *const Packet) []const u8 {
+    return self.payload[0..self.len];
 }
 
 test "to buffer" {
@@ -82,6 +104,8 @@ test "to buffer" {
     var p = Packet{
         .from = 0xDEAD,
         .to = 0xBEEF,
+        .origin = 0x1234,
+        .dest = 0x5678,
 
         .ack = false,
         .broadcast = true,
@@ -105,6 +129,12 @@ test "to buffer" {
         0xBE,
         0xEF,
 
+        0x12,
+        0x34,
+
+        0x56,
+        0x78,
+
         0x48,
 
         0x02,
@@ -115,8 +145,8 @@ test "to buffer" {
         // We keep crc as null, so this enforces that
         // writing to buffer with a null crc first
         // calculates the crc
-        0x46,
-        0xE8,
+        0xF1,
+        0xA8,
     };
 
     try std.testing.expectEqualSlices(u8, &expected, packet_buf);

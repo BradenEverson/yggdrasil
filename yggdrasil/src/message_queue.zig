@@ -4,7 +4,9 @@
 //! the top level Yggdrasil package can then be polled for
 //! the highest priority packet to send
 
-const PriorityQueue = @import("message_queue/priority_queue.zig").PriorityQueue;
+const priority_queue = @import("message_queue/priority_queue.zig");
+const PriorityQueue = priority_queue.PriorityQueue;
+pub const PushError = priority_queue.PQError;
 const NetworkPacket = @import("network_packet.zig");
 
 pub const MAX_NEIGHBORS: usize = 64;
@@ -28,7 +30,7 @@ cursor: usize = 0,
 
 const MessageQueue = @This();
 
-pub fn pushMessage(mq: *MessageQueue, slot: usize, msg: NetworkPacket, priority: u8) !void {
+pub fn pushMessage(mq: *MessageQueue, slot: usize, msg: NetworkPacket, priority: u8) PushError!void {
     try mq.slots[slot].push(msg, priority);
 }
 
