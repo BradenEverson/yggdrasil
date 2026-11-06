@@ -139,14 +139,15 @@ pub fn readByte(uart: Uart) u8 {
 }
 
 pub fn tryReadByte(uart: Uart) ?u8 {
-    const ring = &rings[@intFromEnum(uart)];
-    if (@atomicLoad(bool, &ring.enabled, .acquire)) return ring.pop();
+    if (ringFor(uart)) |ring| {
+        if (@atomicLoad(bool, &ring.enabled, .acquire)) return ring.pop();
+    }
 
     if ((reg(uart, sr).* & 0x0020) == 0) return null;
     return @truncate(reg(uart, dr).*);
 }
 
-const RX_RING_SIZE: u32 = 1024;
+const RX_RING_SIZE: u32 = 512;
 
 const RxRing = struct {
     buf: [RX_RING_SIZE]u8 = undefined,
@@ -176,7 +177,16 @@ const RxRing = struct {
     }
 };
 
-var rings: [6]RxRing = @splat(.{});
+const irq_uarts = [_]Uart{.usart1};
+
+var rings: [irq_uarts.len]RxRing = @splat(.{});
+
+fn ringFor(uart: Uart) ?*RxRing {
+    inline for (irq_uarts, 0..) |u, i| {
+        if (u == uart) return &rings[i];
+    }
+    return null;
+}
 
 const NVIC_ISER: [*]volatile u32 = @ptrFromInt(0xE000_E100);
 
@@ -191,8 +201,13 @@ fn irqNumber(uart: Uart) u32 {
     };
 }
 
-pub fn enableRxInterrupt(uart: Uart) void {
-    const ring = &rings[@intFromEnum(uart)];
+pub fn enableRxInterrupt(comptime uart: Uart) void {
+    const ring = comptime_ring: {
+        inline for (irq_uarts, 0..) |u, i| {
+            if (u == uart) break :comptime_ring &rings[i];
+        }
+        @compileError(@tagName(uart) ++ " has no RX ring/IRQ handler -- add it to irq_uarts");
+    };
     while ((reg(uart, sr).* & 0x0020) != 0) _ = reg(uart, dr).*;
     @atomicStore(bool, &ring.enabled, true, .release);
 
@@ -203,14 +218,15 @@ pub fn enableRxInterrupt(uart: Uart) void {
 }
 
 pub fn droppedBytes(uart: Uart) u32 {
-    return @atomicLoad(u32, &rings[@intFromEnum(uart)].dropped, .monotonic);
+    const ring = ringFor(uart) orelse return 0;
+    return @atomicLoad(u32, &ring.dropped, .monotonic);
 }
 
-fn handleRx(uart: Uart) void {
+fn handleRx(comptime uart: Uart) void {
     const status = reg(uart, sr).*;
     if ((status & 0x002F) != 0) {
         const byte: u8 = @truncate(reg(uart, dr).*);
-        if ((status & 0x0020) != 0) rings[@intFromEnum(uart)].push(byte);
+        if ((status & 0x0020) != 0) ringFor(uart).?.push(byte);
     }
 }
 

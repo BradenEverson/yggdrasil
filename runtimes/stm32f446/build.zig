@@ -26,8 +26,8 @@ pub fn build(b: *std.Build) void {
     const yggdrasil = b.dependency("yggdrasil", .{
         .target = target,
         .optimize = optimize,
-        .max_neighbors = @as(usize, 16),
-        .max_queue_length = @as(usize, 8),
+        .max_neighbors = @as(usize, 8),
+        .max_queue_length = @as(usize, 2),
     });
 
     obj.root_module.addImport("yggdrasil", yggdrasil.module("yggdrasil"));

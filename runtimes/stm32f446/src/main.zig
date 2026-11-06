@@ -10,7 +10,9 @@ const ina260 = @import("drivers/ina260.zig");
 const debug: hal.uart.Uart = .usart2;
 const lora_uart: hal.uart.Uart = .usart1;
 const BAUD_RATE = 115200;
-const BUF_SIZE = 256;
+const LORA_TX_SIZE = 256;
+const LORA_LINE_SIZE = 32;
+const YGG_RX_SIZE = 64;
 
 const NETWORK_ID: u16 = 5;
 const NODE_ADDR: u16 = node_config.node_addr;
@@ -23,15 +25,12 @@ const RETRANSMIT_TIMEOUT_MS: u32 = 4_000;
 const RETRANSMIT_JITTER_MS: u32 = 1_500;
 const RADIO_BROADCAST_ADDR: u16 = 0;
 
-var lora_rx: [BUF_SIZE]u8 = undefined;
-var lora_tx: [BUF_SIZE]u8 = undefined;
-var ygg_rx: [BUF_SIZE]u8 = undefined;
+var lora_rx: [LORA_LINE_SIZE]u8 = undefined;
+var lora_tx: [LORA_TX_SIZE]u8 = undefined;
+var ygg_rx: [YGG_RX_SIZE]u8 = undefined;
 
-var lora: Rylr = .{
-    .uart = lora_uart,
-    .rx_buffer = &lora_rx,
-    .tx_buffer = &lora_tx,
-};
+var lora: Rylr = undefined;
+var ygg: yggdrasil.Yggdrasil = undefined;
 
 fn radioRead(buf: []u8) yggdrasil.YggdrasilError![]u8 {
     return lora.read(buf);
@@ -121,6 +120,12 @@ fn app() void {
 
     hal.uart.writeStr(debug, "Let's Mesh This Network\r\n");
 
+    lora = .{
+        .uart = lora_uart,
+        .rx_buffer = &lora_rx,
+        .tx_buffer = &lora_tx,
+    };
+
     hal.uart.init(lora_uart, .{
         .baud = BAUD_RATE,
         .tx = .{ .port = .a, .num = 9 },
@@ -143,7 +148,7 @@ fn app() void {
     lora.setAddr(NODE_ADDR) catch |e| fail("setAddr", e);
     hal.timer.delayMs(5000);
 
-    var ygg: yggdrasil.Yggdrasil = .{
+    ygg = .{
         .read_bytes_fn = radioRead,
         .write_bytes_fn = radioWrite,
         .result_cb = onPacket,
@@ -153,7 +158,9 @@ fn app() void {
         .retransmit_timeout_ms = RETRANSMIT_TIMEOUT_MS,
         .retransmit_jitter_ms = RETRANSMIT_JITTER_MS,
         .root_timeout_ms = ROOT_TIMEOUT_MS,
+        .outgoing_packets = .{ .slots = undefined, .tx_buffers = undefined },
     };
+    for (0..yggdrasil.MessageQueue.MAX_NEIGHBORS) |slot| ygg.outgoing_packets.clearSlot(slot);
     ygg.buffer = &ygg_rx;
 
     hal.uart.print(debug, "Node {} ready\r\n", .{NODE_ADDR});
@@ -196,7 +203,7 @@ fn app() void {
     }
 }
 
-fn sample(ygg: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688, power: *const ina260.Ina260) void {
+fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688, power: *const ina260.Ina260) void {
     const r = sensor.measure() catch |e| {
         hal.uart.print(debug, "measure failed: {s}\r\n", .{@errorName(e)});
         return;
@@ -219,7 +226,7 @@ fn sample(ygg: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688, power: *const ina26
 
     const packet: yggdrasil.AppPacket = .{ .op = .sensor_readings, .payload = readings.written() };
 
-    ygg.sendAppToRoot(packet, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
+    node.sendAppToRoot(packet, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
         hal.uart.print(debug, "send failed: {s}\r\n", .{@errorName(e)});
     };
 }

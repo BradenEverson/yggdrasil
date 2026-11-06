@@ -32,7 +32,7 @@ pub const RylrError = error{
     BufferTooSmall,
 };
 
-const INBOX_SIZE: u32 = 1024;
+const INBOX_SIZE: u32 = 256;
 
 const LineState = enum { text, rcv_addr, rcv_len, rcv_data, rcv_trailer };
 
@@ -49,8 +49,10 @@ pub fn reset(self: *Self) void {
 }
 
 pub fn poll(self: *Self) void {
-    while (hal.uart.tryReadByte(self.uart)) |byte|
+    while (self.inbox_head -% self.inbox_tail < INBOX_SIZE) {
+        const byte = hal.uart.tryReadByte(self.uart) orelse break;
         _ = self.feed(byte);
+    }
 }
 
 pub fn read(self: *Self, buf: []u8) []u8 {
