@@ -29,6 +29,8 @@ pub fn processAck(ygg: *Yggdrasil, mq_map: *routing.MessageQueueMap, nesn: bool)
     if (nesn != mq_map.sn) {
         ygg.outgoing_packets.ackTxBuffer(mq_map.mq_idx);
         mq_map.sn = !mq_map.sn;
+        mq_map.sent = false;
+        mq_map.retries = 0;
     }
 }
 

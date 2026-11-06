@@ -19,14 +19,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    obj.bundle_compiler_rt = true;
+    obj.link_function_sections = true;
+    obj.link_data_sections = true;
+
     const yggdrasil = b.dependency("yggdrasil", .{
         .target = target,
         .optimize = optimize,
+        .max_neighbors = @as(usize, 16),
+        .max_queue_length = @as(usize, 8),
     });
 
     obj.root_module.addImport("yggdrasil", yggdrasil.module("yggdrasil"));
 
-    const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "-T", "flash.ld", "-o" });
+    const node_config = b.addOptions();
+    node_config.addOption(u16, "node_addr", b.option(u16, "node_addr", "Yggdrasil address of this node") orelse 1);
+    obj.root_module.addOptions("node_config", node_config);
+
+    const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "--gc-sections", "-T", "flash.ld", "-o" });
     const elf_file = ld_cmd.addOutputFileArg("ztm32.elf");
     ld_cmd.addArtifactArg(obj);
 

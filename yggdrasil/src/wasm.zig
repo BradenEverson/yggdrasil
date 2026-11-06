@@ -158,11 +158,39 @@ export fn ygg_register_neighbor(h: u32, address: u16, slot: u32) i32 {
     return 0;
 }
 
-export fn ygg_set_route(h: u32, dest: u16, slot: u32) i32 {
+export fn ygg_set_route(h: u32, dest: u16, slot: u32, hops: u8) i32 {
     const node = get(h) orelse return -1;
     if (slot >= MessageQueue.MAX_NEIGHBORS) return 2;
-    node.ygg.forwarding_table.setRoute(dest, slot) catch return 1;
+    node.ygg.forwarding_table.setRoute(dest, slot, hops) catch return 1;
     return 0;
+}
+
+export fn ygg_set_is_root(h: u32, is_root: bool) void {
+    const node = get(h) orelse return;
+    node.ygg.is_root = is_root;
+}
+
+export fn ygg_announce_root(h: u32) i32 {
+    const node = enter(h) orelse return -1;
+    node.ygg.announceRoot();
+    return 0;
+}
+
+export fn ygg_root_address(h: u32) i32 {
+    const node = get(h) orelse return -1;
+    const root = node.ygg.rootAddress() orelse return -1;
+    return root;
+}
+
+export fn ygg_send_to_root(
+    h: u32,
+    payload_ptr: [*]const u8,
+    payload_len: usize,
+    priority: u8,
+) i32 {
+    const node = get(h) orelse return -1;
+    const root = node.ygg.root orelse return 4;
+    return ygg_send(h, root.addr, payload_ptr, payload_len, priority);
 }
 
 export fn ygg_remove_route(h: u32, dest: u16) void {
@@ -342,13 +370,16 @@ fn writeSnapshot(w: *Writer, node: *Node) Writer.Error!void {
     try writeList(w, ft.forwarding_table[0..@min(ft.num_forwards, ft.forwarding_table.len)]);
     try w.writeAll("}");
 
+    try w.print(",\"is_root\":{},\"root\":", .{y.is_root});
+    try writeValue(w, y.root);
+
     try w.writeAll("}");
 }
 
 fn writePacket(w: *Writer, p: *const NetworkPacket) Writer.Error!void {
     try w.print(
-        "{{\"from\":{d},\"to\":{d},\"origin\":{d},\"dest\":{d},\"ack\":{},\"broadcast\":{},\"nack\":{},\"sn\":{},\"nesn\":{},\"len\":{d},\"crc\":",
-        .{ p.from, p.to, p.origin, p.dest, p.ack, p.broadcast, p.nack, p.sn, p.nesn, p.len },
+        "{{\"from\":{d},\"to\":{d},\"origin\":{d},\"dest\":{d},\"ttl\":{d},\"ack\":{},\"broadcast\":{},\"nack\":{},\"sn\":{},\"nesn\":{},\"len\":{d},\"crc\":",
+        .{ p.from, p.to, p.origin, p.dest, p.ttl, p.ack, p.broadcast, p.nack, p.sn, p.nesn, p.len },
     );
     try writeValue(w, p.crc);
     try w.writeAll(",\"payload\":");

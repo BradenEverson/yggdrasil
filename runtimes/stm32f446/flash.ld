@@ -7,6 +7,8 @@ MEMORY
     RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
 }
 
+ENTRY(run)
+
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 
 PROVIDE(NMI_Handler        = Default_Handler);
@@ -18,6 +20,7 @@ PROVIDE(SVC_Handler        = Default_Handler);
 PROVIDE(DebugMon_Handler   = Default_Handler);
 PROVIDE(PendSV_Handler     = Default_Handler);
 PROVIDE(SysTick_Handler    = Default_Handler);
+PROVIDE(USART1_IRQHandler  = Default_Handler);
 
 SECTIONS {
     .vectors :
@@ -35,6 +38,44 @@ SECTIONS {
         LONG(0)
         LONG(PendSV_Handler + 1)
         LONG(SysTick_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(Default_Handler + 1)
+        LONG(USART1_IRQHandler + 1)
     } > FLASH
 
     .rodata :
@@ -46,12 +87,14 @@ SECTIONS {
     .text :
     {
         . = ALIGN(4);
+        KEEP(*(.text*Handler))
         *(.text*)
     } > FLASH
 
     .ARM.exidx :
     {
         *(.ARM.exidx*)
+        *(.ARM.extab*)
     } > FLASH
 
     _sidata = LOADADDR(.data);

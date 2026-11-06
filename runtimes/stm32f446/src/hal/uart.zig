@@ -133,13 +133,89 @@ pub fn writeByte(uart: Uart, byte: u8) void {
 }
 
 pub fn readByte(uart: Uart) u8 {
-    while ((reg(uart, sr).* & 0x0020) == 0) {}
-    return @truncate(reg(uart, dr).*);
+    while (true) {
+        if (tryReadByte(uart)) |byte| return byte;
+    }
 }
 
 pub fn tryReadByte(uart: Uart) ?u8 {
+    const ring = &rings[@intFromEnum(uart)];
+    if (@atomicLoad(bool, &ring.enabled, .acquire)) return ring.pop();
+
     if ((reg(uart, sr).* & 0x0020) == 0) return null;
     return @truncate(reg(uart, dr).*);
+}
+
+const RX_RING_SIZE: u32 = 1024;
+
+const RxRing = struct {
+    buf: [RX_RING_SIZE]u8 = undefined,
+    head: u32 = 0,
+    tail: u32 = 0,
+    enabled: bool = false,
+    dropped: u32 = 0,
+
+    fn push(ring: *RxRing, byte: u8) void {
+        const head = @atomicLoad(u32, &ring.head, .monotonic);
+        const tail = @atomicLoad(u32, &ring.tail, .acquire);
+        if (head -% tail >= RX_RING_SIZE) {
+            ring.dropped +%= 1;
+            return;
+        }
+        ring.buf[head % RX_RING_SIZE] = byte;
+        @atomicStore(u32, &ring.head, head +% 1, .release);
+    }
+
+    fn pop(ring: *RxRing) ?u8 {
+        const tail = @atomicLoad(u32, &ring.tail, .monotonic);
+        const head = @atomicLoad(u32, &ring.head, .acquire);
+        if (head == tail) return null;
+        const byte = ring.buf[tail % RX_RING_SIZE];
+        @atomicStore(u32, &ring.tail, tail +% 1, .release);
+        return byte;
+    }
+};
+
+var rings: [6]RxRing = @splat(.{});
+
+const NVIC_ISER: [*]volatile u32 = @ptrFromInt(0xE000_E100);
+
+fn irqNumber(uart: Uart) u32 {
+    return switch (uart) {
+        .usart1 => 37,
+        .usart2 => 38,
+        .usart3 => 39,
+        .uart4 => 52,
+        .uart5 => 53,
+        .usart6 => 71,
+    };
+}
+
+pub fn enableRxInterrupt(uart: Uart) void {
+    const ring = &rings[@intFromEnum(uart)];
+    while ((reg(uart, sr).* & 0x0020) != 0) _ = reg(uart, dr).*;
+    @atomicStore(bool, &ring.enabled, true, .release);
+
+    reg(uart, cr1).* |= 0x0020;
+
+    const irq = irqNumber(uart);
+    NVIC_ISER[irq / 32] = @as(u32, 1) << @intCast(irq % 32);
+}
+
+pub fn droppedBytes(uart: Uart) u32 {
+    return @atomicLoad(u32, &rings[@intFromEnum(uart)].dropped, .monotonic);
+}
+
+fn handleRx(uart: Uart) void {
+    const status = reg(uart, sr).*;
+    if ((status & 0x002F) != 0) {
+        const byte: u8 = @truncate(reg(uart, dr).*);
+        if ((status & 0x0020) != 0) rings[@intFromEnum(uart)].push(byte);
+    }
+}
+
+export fn USART1_IRQHandler() void {
+    handleRx(.usart1);
 }
 
 pub fn writeStr(uart: Uart, str: []const u8) void {

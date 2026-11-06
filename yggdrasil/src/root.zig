@@ -12,7 +12,7 @@ pub const ForwardingTable = routing.ForwardingTable;
 
 /// Errors that are common to most APIs and
 /// communication methods
-pub const YggdrasilError = error{};
+pub const YggdrasilError = error{ ReadFailed, WriteFailed };
 const LARGEST_PACKET_SIZE: usize = 240;
 
 /// Scratch space for serializing an outgoing packet: header + max payload + crc
@@ -20,6 +20,14 @@ const TX_BUFFER_SIZE: usize = 256;
 
 pub const SendError = error{ NoRoute, PayloadTooLarge } || MessageQueue.PushError;
 pub const NeighborError = ForwardingTable.Error;
+
+pub const RootRoute = struct {
+    addr: u16,
+    via: u16,
+    hops: u8,
+    seq: u16,
+    heard_at: u32,
+};
 
 /// The states we can be in while reading
 /// from the incoming stream
@@ -38,6 +46,8 @@ pub const ParseState = enum {
     awaiting_dest_msb,
     awaiting_dest_lsb,
 
+    awaiting_ttl,
+
     awaiting_flags,
 
     awaiting_len,
@@ -52,9 +62,9 @@ pub const ParseState = enum {
 /// and whatever communication method there is at the
 /// physical level (UART, LoRa, whateva)
 pub const Yggdrasil = struct {
-    /// A blocking consume function that reads
-    /// a slice of bytes from a stream source
-    /// (UART, LoRa, BLE, etc)
+    /// A non-blocking consume function that reads
+    /// whatever bytes are currently available from a
+    /// stream source (UART, LoRa, BLE, etc), possibly none
     read_bytes_fn: *const fn (buf: []u8) YggdrasilError![]u8,
     write_bytes_fn: *const fn (buf: []u8) YggdrasilError!void,
 
@@ -73,13 +83,36 @@ pub const Yggdrasil = struct {
 
     building_packet: NetworkPacket = .{},
 
+    clock: ?*const fn () u32 = null,
+    neighbor_lost_cb: ?*const fn (addr: u16) void = null,
+    retransmit_timeout_ms: u32 = 3000,
+    retransmit_jitter_ms: u32 = 1000,
+    max_retries: u8 = 8,
+    rng_state: u32 = 0,
+
+    is_root: bool = false,
+    root: ?RootRoute = null,
+    root_seq: u16 = 0,
+    root_timeout_ms: u32 = 90_000,
+    announce_jitter_ms: u32 = 2_000,
+    hop_slack: u8 = 2,
+    pending_announce: ?NetworkPacket = null,
+    announce_at: u32 = 0,
+
     /// scheduling mechanism to wrap around all neighbors' message queues
     pub fn requestWrite(ygg: *Yggdrasil) YggdrasilError!bool {
         const mq = &ygg.outgoing_packets;
         const ft = &ygg.forwarding_table;
+        const now = ygg.currentTime();
+
+        ygg.dropUnresponsiveNeighbors(now);
+        ygg.expireRoot(now);
 
         for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
-            if (!neighbor.ack_pending or mq.txBuffer(neighbor.mq_idx) != null)
+            if (!neighbor.ack_pending)
+                continue;
+
+            if (mq.txBuffer(neighbor.mq_idx) != null and ygg.retransmitDue(neighbor, now))
                 continue;
 
             var ack = NetworkPacket{
@@ -95,7 +128,16 @@ pub const Yggdrasil = struct {
             return true;
         }
 
-        const slot = mq.roundRobinTx() orelse return false;
+        if (ygg.pending_announce) |*announce| {
+            if (ygg.clock == null or reached(now, ygg.announce_at)) {
+                var packet = announce.*;
+                ygg.pending_announce = null;
+                try ygg.writePacket(&packet);
+                return true;
+            }
+        }
+
+        const slot = mq.roundRobinTxWhere(Schedule{ .ygg = ygg, .now = now }, Schedule.ready) orelse return false;
         const packet = mq.txBuffer(slot).?;
 
         const neighbor = if (packet.broadcast) null else ft.neighborBySlot(slot);
@@ -105,6 +147,11 @@ pub const Yggdrasil = struct {
             packet.sn = n.sn;
             packet.nesn = n.nesn;
             n.ack_pending = false;
+
+            if (n.sent)
+                n.retries +|= 1;
+            n.sent = true;
+            n.retransmit_at = now +% ygg.retransmit_timeout_ms +% ygg.random(ygg.retransmit_jitter_ms);
         }
 
         try ygg.writePacket(packet);
@@ -113,6 +160,77 @@ pub const Yggdrasil = struct {
             mq.ackTxBuffer(slot);
 
         return true;
+    }
+
+    const Schedule = struct {
+        ygg: *Yggdrasil,
+        now: u32,
+
+        fn ready(sched: Schedule, slot: usize) bool {
+            const neighbor = sched.ygg.forwarding_table.neighborBySlot(slot) orelse return true;
+            return sched.ygg.retransmitDue(neighbor, sched.now);
+        }
+    };
+
+    fn currentTime(ygg: *const Yggdrasil) u32 {
+        const clock = ygg.clock orelse return 0;
+        return clock();
+    }
+
+    fn retransmitDue(ygg: *const Yggdrasil, neighbor: *const routing.MessageQueueMap, at: u32) bool {
+        if (ygg.clock == null or !neighbor.sent)
+            return true;
+
+        return reached(at, neighbor.retransmit_at);
+    }
+
+    fn reached(at: u32, deadline: u32) bool {
+        return @as(i32, @bitCast(at -% deadline)) >= 0;
+    }
+
+    fn random(ygg: *Yggdrasil, max: u32) u32 {
+        if (max == 0)
+            return 0;
+
+        if (ygg.rng_state == 0)
+            ygg.rng_state = (@as(u32, ygg.address) *% 2654435761) | 1;
+
+        var x = ygg.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        ygg.rng_state = x;
+
+        return x % (max +| 1);
+    }
+
+    fn dropUnresponsiveNeighbors(ygg: *Yggdrasil, at: u32) void {
+        if (ygg.clock == null)
+            return;
+
+        const ft = &ygg.forwarding_table;
+        var i = ft.num_registered_output_map;
+        while (i > 0) {
+            i -= 1;
+            const neighbor = &ft.output_map[i];
+            if (neighbor.sent and neighbor.retries >= ygg.max_retries and ygg.retransmitDue(neighbor, at))
+                ygg.dropNeighbor(neighbor.addr);
+        }
+    }
+
+    pub fn dropNeighbor(ygg: *Yggdrasil, addr: u16) void {
+        const neighbor = ygg.forwarding_table.neighborByAddr(addr) orelse return;
+
+        ygg.outgoing_packets.clearSlot(neighbor.mq_idx);
+        ygg.forwarding_table.removeNeighbor(addr);
+
+        if (ygg.root) |current| {
+            if (current.via == addr)
+                ygg.root = null;
+        }
+
+        if (ygg.neighbor_lost_cb) |cb|
+            cb(addr);
     }
 
     fn writePacket(ygg: *Yggdrasil, packet: *NetworkPacket) YggdrasilError!void {
@@ -142,17 +260,117 @@ pub const Yggdrasil = struct {
     }
 
     pub fn send(ygg: *Yggdrasil, dest: u16, payload: []const u8, priority: u8) SendError!void {
-        const hop = ygg.forwarding_table.nextHop(dest) orelse return error.NoRoute;
+        const found = ygg.forwarding_table.route(dest) orelse return error.NoRoute;
 
         var packet = NetworkPacket{
             .from = ygg.address,
-            .to = hop.addr,
+            .to = found.neighbor.addr,
             .origin = ygg.address,
             .dest = dest,
+            .ttl = found.hops +| ygg.hop_slack,
         };
         try packet.setPayload(payload);
 
-        try ygg.outgoing_packets.pushMessage(hop.mq_idx, packet, priority);
+        try ygg.outgoing_packets.pushMessage(found.neighbor.mq_idx, packet, priority);
+    }
+
+    pub fn rootAddress(ygg: *const Yggdrasil) ?u16 {
+        if (ygg.is_root)
+            return ygg.address;
+
+        const current = ygg.root orelse return null;
+        return current.addr;
+    }
+
+    pub fn sendToRoot(ygg: *Yggdrasil, payload: []const u8, priority: u8) SendError!void {
+        const current = ygg.root orelse return error.NoRoute;
+        try ygg.send(current.addr, payload, priority);
+    }
+
+    pub fn sendAppToRoot(ygg: *Yggdrasil, app: AppPacket, priority: u8) SendError!void {
+        const current = ygg.root orelse return error.NoRoute;
+        try ygg.sendApp(current.addr, app, priority);
+    }
+
+    pub fn announceRoot(ygg: *Yggdrasil) void {
+        if (!ygg.is_root)
+            return;
+
+        ygg.root_seq +%= 1;
+        ygg.queueAnnouncement(.{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 }, ygg.currentTime());
+    }
+
+    fn queueAnnouncement(ygg: *Yggdrasil, ann: AppPacket.RootAnnouncement, at: u32) void {
+        var packet = NetworkPacket{
+            .from = ygg.address,
+            .to = NetworkPacket.BROADCAST_ADDR,
+            .origin = ygg.address,
+            .dest = NetworkPacket.BROADCAST_ADDR,
+            .broadcast = true,
+            .len = 1 + AppPacket.RootAnnouncement.LEN,
+        };
+        packet.payload[0] = @backingInt(AppPacket.Opcode.im_a_root);
+        ann.write(packet.payload[1..][0..AppPacket.RootAnnouncement.LEN]);
+
+        ygg.pending_announce = packet;
+        ygg.announce_at = at;
+    }
+
+    fn handleRootAnnouncement(ygg: *Yggdrasil, from: u16, payload: []const u8) void {
+        if (ygg.is_root)
+            return;
+
+        const ann = AppPacket.RootAnnouncement.parse(payload) orelse return;
+        if (ann.root == ygg.address)
+            return;
+
+        const neighbor = ygg.learnNeighbor(from) catch return;
+        const hops = ann.hops +| 1;
+        const now = ygg.currentTime();
+
+        if (ygg.root) |*current| {
+            if (current.addr == ann.root) {
+                const newer = @as(i16, @bitCast(ann.seq -% current.seq)) > 0;
+                const shorter = ann.seq == current.seq and hops < current.hops;
+
+                if (!newer and !shorter) {
+                    if (ann.seq == current.seq and from == current.via)
+                        current.heard_at = now;
+                    return;
+                }
+            } else {
+                if (hops >= current.hops)
+                    return;
+
+                ygg.forwarding_table.removeRoute(current.addr);
+            }
+        }
+
+        ygg.forwarding_table.setRoute(ann.root, neighbor.mq_idx, hops) catch return;
+        ygg.root = .{
+            .addr = ann.root,
+            .via = from,
+            .hops = hops,
+            .seq = ann.seq,
+            .heard_at = now,
+        };
+
+        ygg.queueAnnouncement(
+            .{ .root = ann.root, .seq = ann.seq, .hops = hops },
+            now +% ygg.random(ygg.announce_jitter_ms),
+        );
+    }
+
+    fn expireRoot(ygg: *Yggdrasil, at: u32) void {
+        if (ygg.clock == null or ygg.root_timeout_ms == 0)
+            return;
+
+        const current = ygg.root orelse return;
+        if (at -% current.heard_at < ygg.root_timeout_ms)
+            return;
+
+        ygg.forwarding_table.removeRoute(current.addr);
+        ygg.root = null;
     }
 
     pub fn sendApp(ygg: *Yggdrasil, dest: u16, app: AppPacket, priority: u8) SendError!void {
@@ -183,11 +401,8 @@ pub const Yggdrasil = struct {
         neighbor.sn = false;
         neighbor.nesn = false;
         neighbor.ack_pending = false;
-    }
-
-    fn isHello(packet: *const NetworkPacket) bool {
-        const app = AppPacket.parse(packet.body()) orelse return false;
-        return app.op == .hello;
+        neighbor.sent = false;
+        neighbor.retries = 0;
     }
 
     fn replyHello(ygg: *Yggdrasil, addr: u16) (NeighborError || SendError)!void {
@@ -211,6 +426,9 @@ pub const Yggdrasil = struct {
     }
 
     fn forward(ygg: *Yggdrasil, packet: NetworkPacket) void {
+        if (packet.ttl <= 1)
+            return;
+
         const hop = ygg.forwarding_table.nextHop(packet.dest) orelse return;
 
         if (hop.addr == packet.from)
@@ -219,6 +437,7 @@ pub const Yggdrasil = struct {
         var forwarded = packet;
         forwarded.from = ygg.address;
         forwarded.to = hop.addr;
+        forwarded.ttl = packet.ttl - 1;
         forwarded.crc = null;
 
         ygg.outgoing_packets.pushMessage(hop.mq_idx, forwarded, MessageQueue.PRIORITY_LOW) catch {};
@@ -228,8 +447,13 @@ pub const Yggdrasil = struct {
         if (packet.from == ygg.address)
             return;
 
-        if (isHello(&packet))
-            ygg.replyHello(packet.from) catch {};
+        if (AppPacket.parse(packet.body())) |app| {
+            switch (app.op) {
+                .hello => ygg.replyHello(packet.from) catch {},
+                .im_a_root => ygg.handleRootAnnouncement(packet.from, app.payload),
+                else => {},
+            }
+        }
 
         ygg.result_cb(packet);
     }
@@ -245,7 +469,7 @@ pub const Yggdrasil = struct {
         if (packet.to != ygg.address)
             return;
 
-        if (packet.ack and isHello(&packet))
+        if (packet.from != ygg.address)
             _ = ygg.learnNeighbor(packet.from) catch {};
 
         if (ygg.forwarding_table.neighborByAddr(packet.from)) |neighbor| {
@@ -336,6 +560,11 @@ pub const Yggdrasil = struct {
             },
             .awaiting_dest_lsb => {
                 ygg.building_packet.dest |= byte;
+                ygg.state = .awaiting_ttl;
+            },
+
+            .awaiting_ttl => {
+                ygg.building_packet.ttl = byte;
                 ygg.state = .awaiting_flags;
             },
 
@@ -502,8 +731,8 @@ test "packets are forwarded across hops with origin preserved" {
 
     try std.testing.expect(c.forwarding_table.neighborByAddr(1) == null);
 
-    try a.forwarding_table.setRoute(3, a.forwarding_table.neighborByAddr(2).?.mq_idx);
-    try c.forwarding_table.setRoute(1, c.forwarding_table.neighborByAddr(2).?.mq_idx);
+    try a.forwarding_table.setRoute(3, a.forwarding_table.neighborByAddr(2).?.mq_idx, 2);
+    try c.forwarding_table.setRoute(1, c.forwarding_table.neighborByAddr(2).?.mq_idx, 2);
 
     TestNet.delivered = null;
 
@@ -526,6 +755,230 @@ test "packets are forwarded across hops with origin preserved" {
     try std.testing.expect(b.outgoing_packets.allEmpty());
 
     try std.testing.expectError(error.NoRoute, b.send(99, "x", MessageQueue.PRIORITY_LOW));
+}
+
+const TestClock = struct {
+    var time: u32 = 0;
+    var lost: ?u16 = null;
+
+    fn now() u32 {
+        return time;
+    }
+
+    fn onLost(addr: u16) void {
+        lost = addr;
+    }
+
+    fn node(addr: u16) Yggdrasil {
+        var ygg = TestNet.node(addr);
+        ygg.clock = now;
+        ygg.neighbor_lost_cb = onLost;
+        ygg.retransmit_timeout_ms = 100;
+        ygg.retransmit_jitter_ms = 10;
+        ygg.max_retries = 2;
+        return ygg;
+    }
+};
+
+test "max size packets fit the radio and parse" {
+    var a = TestNet.node(1);
+    var b = TestNet.node(2);
+    _ = try a.registerNeighbor(2, 0);
+    _ = try b.registerNeighbor(1, 0);
+
+    var payload: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
+
+    try a.send(2, &payload, MessageQueue.PRIORITY_LOW);
+    TestNet.delivered = null;
+    try TestNet.transmit(&a, &.{&b});
+
+    try std.testing.expectEqual(LARGEST_PACKET_SIZE, TestNet.wire_len);
+    try std.testing.expectEqualSlices(u8, &payload, TestNet.delivered.?.body());
+    try std.testing.expectError(error.PayloadTooLarge, a.send(2, &(payload ++ [_]u8{0}), MessageQueue.PRIORITY_LOW));
+}
+
+test "retransmits wait for the timer and unresponsive neighbors are dropped" {
+    TestClock.time = 0;
+    TestClock.lost = null;
+
+    var a = TestClock.node(1);
+    _ = try a.registerNeighbor(2, 0);
+    try a.forwarding_table.setRoute(3, 0, 2);
+
+    try a.send(2, "x", MessageQueue.PRIORITY_LOW);
+
+    try std.testing.expect(try a.requestWrite());
+    try std.testing.expect(!try a.requestWrite());
+
+    TestClock.time = 99;
+    try std.testing.expect(!try a.requestWrite());
+
+    TestClock.time = 110;
+    try std.testing.expect(try a.requestWrite());
+    try std.testing.expect(!try a.requestWrite());
+
+    TestClock.time = 220;
+    try std.testing.expect(try a.requestWrite());
+    try std.testing.expect(TestClock.lost == null);
+
+    TestClock.time = 330;
+    try std.testing.expect(!try a.requestWrite());
+    try std.testing.expectEqual(@as(?u16, 2), TestClock.lost);
+    try std.testing.expect(a.forwarding_table.nextHop(2) == null);
+    try std.testing.expect(a.forwarding_table.nextHop(3) == null);
+    try std.testing.expect(a.outgoing_packets.allEmpty());
+}
+
+test "acked packets stop retransmitting and acks skip the timer" {
+    TestClock.time = 0;
+    TestClock.lost = null;
+
+    var a = TestClock.node(1);
+    var b = TestClock.node(2);
+    _ = try a.registerNeighbor(2, 0);
+    _ = try b.registerNeighbor(1, 0);
+
+    try a.send(2, "x", MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&a, &.{});
+
+    try b.send(1, "y", MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&b, &.{&a});
+
+    try TestNet.transmit(&a, &.{&b});
+    try std.testing.expectEqual(NetworkPacket.HEADER_LEN + 2, TestNet.wire_len);
+    try std.testing.expect(b.outgoing_packets.allEmpty());
+    try std.testing.expect(!a.outgoing_packets.allEmpty());
+
+    TestClock.time = 200;
+    TestNet.delivered = null;
+    try TestNet.transmit(&a, &.{&b});
+    try std.testing.expectEqualSlices(u8, "x", TestNet.delivered.?.body());
+
+    try TestNet.transmit(&b, &.{&a});
+    try std.testing.expect(a.outgoing_packets.allEmpty());
+
+    TestClock.time = 1000;
+    try std.testing.expect(!try a.requestWrite());
+    try std.testing.expect(!try b.requestWrite());
+    try std.testing.expect(TestClock.lost == null);
+}
+
+fn announcementFrom(ygg: *Yggdrasil, root: u16, seq: u16, hops: u8) void {
+    ygg.queueAnnouncement(.{ .root = root, .seq = seq, .hops = hops }, 0);
+}
+
+test "root announcements build routes across hops and set ttl from them" {
+    var a = TestNet.node(1);
+    var b = TestNet.node(2);
+    var c = TestNet.node(3);
+    a.is_root = true;
+    c.hop_slack = 0;
+
+    a.announceRoot();
+    try TestNet.transmit(&a, &.{&b});
+
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(u8, 1), b.root.?.hops);
+    try std.testing.expect(c.rootAddress() == null);
+
+    try TestNet.transmit(&b, &.{ &a, &c });
+
+    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
+    try std.testing.expectEqual(@as(u16, 2), c.root.?.via);
+    try std.testing.expect(a.root == null);
+
+    try TestNet.transmit(&c, &.{&b});
+    try std.testing.expectEqual(@as(u8, 1), b.root.?.hops);
+    try std.testing.expect(b.pending_announce == null);
+
+    TestNet.delivered = null;
+    try c.sendToRoot("r", MessageQueue.PRIORITY_LOW);
+    try std.testing.expectEqual(@as(u8, 2), c.outgoing_packets.txBuffer(c.forwarding_table.neighborByAddr(2).?.mq_idx).?.ttl);
+
+    try TestNet.transmit(&c, &.{&b});
+    try TestNet.transmit(&b, &.{&c});
+    try TestNet.transmit(&b, &.{&a});
+
+    const got = TestNet.delivered.?;
+    try std.testing.expectEqual(@as(u16, 3), got.origin);
+    try std.testing.expectEqual(@as(u16, 1), got.dest);
+    try std.testing.expectEqual(@as(u8, 1), got.ttl);
+    try std.testing.expectEqualSlices(u8, "r", got.body());
+}
+
+test "packets are dropped when their hop limit runs out" {
+    var b = TestNet.node(2);
+    var c = TestNet.node(3);
+    c.hop_slack = 0;
+
+    _ = try b.registerNeighbor(1, 0);
+    _ = try b.registerNeighbor(3, 1);
+    _ = try c.registerNeighbor(2, 0);
+    try c.forwarding_table.setRoute(1, 0, 1);
+
+    try c.send(1, "r", MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&c, &.{&b});
+
+    try TestNet.transmit(&b, &.{&c});
+    try std.testing.expect(c.outgoing_packets.allEmpty());
+    try std.testing.expect(b.outgoing_packets.allEmpty());
+    try std.testing.expect(!try b.requestWrite());
+}
+
+test "newer sequence numbers win, shorter paths win within a sequence" {
+    var a = TestNet.node(10);
+    var b = TestNet.node(20);
+    var c = TestNet.node(30);
+
+    announcementFrom(&a, 1, 5, 3);
+    try TestNet.transmit(&a, &.{&c});
+    try std.testing.expectEqual(@as(u8, 4), c.root.?.hops);
+    try std.testing.expectEqual(@as(u16, 10), c.root.?.via);
+
+    announcementFrom(&b, 1, 5, 1);
+    try TestNet.transmit(&b, &.{&c});
+    try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
+    try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
+
+    announcementFrom(&a, 1, 5, 0);
+    try TestNet.transmit(&a, &.{&c});
+    try std.testing.expectEqual(@as(u8, 1), c.root.?.hops);
+    try std.testing.expectEqual(@as(u16, 10), c.forwarding_table.nextHop(1).?.addr);
+
+    announcementFrom(&b, 1, 4, 0);
+    try TestNet.transmit(&b, &.{&c});
+    try std.testing.expectEqual(@as(u16, 10), c.root.?.via);
+
+    announcementFrom(&b, 1, 6, 7);
+    try TestNet.transmit(&b, &.{&c});
+    try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
+    try std.testing.expectEqual(@as(u8, 8), c.root.?.hops);
+    try std.testing.expectEqual(@as(u8, 8), c.forwarding_table.route(1).?.hops);
+}
+
+test "root routes expire without fresh announcements" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(1);
+    var b = TestClock.node(2);
+    a.is_root = true;
+    b.root_timeout_ms = 1000;
+
+    a.announceRoot();
+    try TestNet.transmit(&a, &.{&b});
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+
+    TestClock.time = 999;
+    _ = try b.requestWrite();
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+
+    TestClock.time = 1000;
+    _ = try b.requestWrite();
+    try std.testing.expect(b.rootAddress() == null);
+    try std.testing.expect(b.forwarding_table.forwarding_table[0..b.forwarding_table.num_forwards].len == 0);
+    try std.testing.expectError(error.NoRoute, b.sendToRoot("x", MessageQueue.PRIORITY_LOW));
 }
 
 test {

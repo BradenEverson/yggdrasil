@@ -9,12 +9,14 @@ const PriorityQueue = priority_queue.PriorityQueue;
 pub const PushError = priority_queue.PQError;
 const NetworkPacket = @import("network_packet.zig");
 
-pub const MAX_NEIGHBORS: usize = 64;
+const config = @import("config");
+
+pub const MAX_NEIGHBORS: usize = config.max_neighbors;
 
 /// Maximum size of a single message queue, messages
 /// need to be acked at the link layer level before they
 /// are popped from the mq btw ;)
-pub const MAX_MESSAGE_QUEUE_LENGTH: usize = 16;
+pub const MAX_MESSAGE_QUEUE_LENGTH: usize = config.max_queue_length;
 
 const MessageSlots = [MAX_NEIGHBORS]PriorityQueue(NetworkPacket, MAX_MESSAGE_QUEUE_LENGTH);
 
@@ -57,7 +59,24 @@ pub fn ackTxBuffer(mq: *MessageQueue, slot: usize) void {
     mq.tx_buffers[slot] = null;
 }
 
+pub fn clearSlot(mq: *MessageQueue, slot: usize) void {
+    mq.slots[slot] = .{};
+    mq.tx_buffers[slot] = null;
+}
+
+fn always(_: void, _: usize) bool {
+    return true;
+}
+
 pub fn roundRobinTx(mq: *MessageQueue) ?usize {
+    return mq.roundRobinTxWhere({}, always);
+}
+
+pub fn roundRobinTxWhere(
+    mq: *MessageQueue,
+    context: anytype,
+    comptime ready: fn (@TypeOf(context), usize) bool,
+) ?usize {
     if (mq.registered_nodes == 0)
         return null;
 
@@ -68,7 +87,7 @@ pub fn roundRobinTx(mq: *MessageQueue) ?usize {
         const slot = mq.cursor;
         mq.cursor = (mq.cursor + 1) % mq.registered_nodes;
 
-        if (mq.txBuffer(slot) != null)
+        if (mq.txBuffer(slot) != null and ready(context, slot))
             return slot;
     }
 

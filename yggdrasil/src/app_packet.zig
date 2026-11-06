@@ -59,6 +59,31 @@ pub fn write(app: AppPacket, buf: []u8) error{NoSpaceLeft}![]u8 {
     return buf[0 .. 1 + app.payload.len];
 }
 
+pub const RootAnnouncement = struct {
+    root: u16,
+    seq: u16,
+    hops: u8,
+
+    pub const LEN: usize = 5;
+
+    pub fn parse(payload: []const u8) ?RootAnnouncement {
+        if (payload.len < LEN)
+            return null;
+
+        return .{
+            .root = std.mem.readInt(u16, payload[0..2], .big),
+            .seq = std.mem.readInt(u16, payload[2..4], .big),
+            .hops = payload[4],
+        };
+    }
+
+    pub fn write(ann: RootAnnouncement, buf: *[LEN]u8) void {
+        std.mem.writeInt(u16, buf[0..2], ann.root, .big);
+        std.mem.writeInt(u16, buf[2..4], ann.seq, .big);
+        buf[4] = ann.hops;
+    }
+};
+
 pub const SensorReadingStream = struct {
     buf: []const u8,
 
@@ -96,6 +121,31 @@ pub const SensorReadingStream = struct {
     }
 };
 
+pub const SensorReadingWriter = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    pub fn add(writer: *SensorReadingWriter, name: []const u8, value: Value) error{NoSpaceLeft}!void {
+        const val_type = std.meta.activeTag(value);
+        const entry_len = 1 + name.len + val_type.byteCount();
+
+        if (entry_len > std.math.maxInt(u8) or writer.len + 1 + entry_len > writer.buf.len)
+            return error.NoSpaceLeft;
+
+        const out = writer.buf[writer.len..][0 .. 1 + entry_len];
+        out[0] = @intCast(entry_len);
+        out[1] = @backingInt(val_type);
+        @memcpy(out[2..][0..name.len], name);
+        value.toBytes(out[2 + name.len ..]);
+
+        writer.len += 1 + entry_len;
+    }
+
+    pub fn written(writer: *const SensorReadingWriter) []const u8 {
+        return writer.buf[0..writer.len];
+    }
+};
+
 pub const ValueType = enum(u8) {
     uint8,
     uint16,
@@ -129,6 +179,21 @@ pub const Value = union(ValueType) {
     int64: i64,
     float32: f32,
     float64: f64,
+
+    pub fn toBytes(value: Value, buf: []u8) void {
+        switch (value) {
+            inline else => |v| {
+                const Bits = switch (@sizeOf(@TypeOf(v))) {
+                    1 => u8,
+                    2 => u16,
+                    4 => u32,
+                    8 => u64,
+                    else => unreachable,
+                };
+                std.mem.writeInt(Bits, buf[0..@sizeOf(Bits)], @bitCast(v), .big);
+            },
+        }
+    }
 
     pub fn fromBytes(ty: ValueType, buf: []const u8) Value {
         switch (ty) {
@@ -275,6 +340,46 @@ test "App packet round trip" {
 
     try std.testing.expect(AppPacket.parse(&.{}) == null);
     try std.testing.expect(AppPacket.parse(&.{0xFF}) == null);
+}
+
+test "Root announcement round trip" {
+    var buf: [RootAnnouncement.LEN]u8 = undefined;
+    (RootAnnouncement{ .root = 0xBEEF, .seq = 513, .hops = 4 }).write(&buf);
+
+    const ann = RootAnnouncement.parse(&buf).?;
+    try std.testing.expectEqual(@as(u16, 0xBEEF), ann.root);
+    try std.testing.expectEqual(@as(u16, 513), ann.seq);
+    try std.testing.expectEqual(@as(u8, 4), ann.hops);
+    try std.testing.expect(RootAnnouncement.parse(buf[0..4]) == null);
+}
+
+test "Sensor writer round trips through the stream" {
+    var buf: [64]u8 = undefined;
+    var writer = SensorReadingWriter{ .buf = &buf };
+
+    try writer.add("temp_f", .{ .float32 = 71.25 });
+    try writer.add("pwr_mw", .{ .uint16 = 512 });
+    try writer.add("delta", .{ .int64 = -3 });
+
+    var stream = SensorReadingStream{ .buf = writer.written() };
+
+    var entry = stream.next().?;
+    try std.testing.expectEqualSlices(u8, "temp_f", entry.name);
+    try std.testing.expectEqual(Value{ .float32 = 71.25 }, entry.value);
+
+    entry = stream.next().?;
+    try std.testing.expectEqualSlices(u8, "pwr_mw", entry.name);
+    try std.testing.expectEqual(Value{ .uint16 = 512 }, entry.value);
+
+    entry = stream.next().?;
+    try std.testing.expectEqualSlices(u8, "delta", entry.name);
+    try std.testing.expectEqual(Value{ .int64 = -3 }, entry.value);
+
+    try std.testing.expect(stream.next() == null);
+
+    var small: [8]u8 = undefined;
+    var full = SensorReadingWriter{ .buf = &small };
+    try std.testing.expectError(error.NoSpaceLeft, full.add("too_long", .{ .uint8 = 1 }));
 }
 
 test "Value parsing" {

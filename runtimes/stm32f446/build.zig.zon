@@ -33,8 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .yggdrasil = .{
-            .url = "../../yggdrasil",
-            .hash = "yggdrasil-0.0.0-BHv3eo3nAACnBy5kLB4d4rgjJz3jxsCu2GUYu78AN0y5",
+            .path = "../../yggdrasil",
         },
     },
     .paths = .{

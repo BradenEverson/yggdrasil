@@ -5,7 +5,7 @@ pub const CRC = @import("network_packet/crc.zig");
 
 pub const HEADER: u8 = 0x72;
 pub const BROADCAST_ADDR: u16 = 0xFFFF;
-pub const HEADER_LEN: usize = 11;
+pub const HEADER_LEN: usize = 12;
 
 const ACK_BIT: u8 = 7;
 const BROADCAST_BIT: u8 = 6;
@@ -13,13 +13,14 @@ const NACK_BIT: u8 = 5;
 const SN_BIT: u8 = 4;
 const NESN_BIT: u8 = 3;
 
-/// LoRA max - from - to - origin - dest - flags - len - crc
-pub const MAX_PAYLOAD_SIZE: usize = 240 - 2 - 2 - 2 - 2 - 1 - 1 - 2;
+/// LoRA max - header - from - to - origin - dest - ttl - flags - len - crc
+pub const MAX_PAYLOAD_SIZE: usize = 240 - 1 - 2 - 2 - 2 - 2 - 1 - 1 - 1 - 2;
 
 from: u16 = 0,
 to: u16 = 0,
 origin: u16 = 0,
 dest: u16 = 0,
+ttl: u8 = 1,
 ack: bool = false,
 broadcast: bool = false,
 nack: bool = false,
@@ -71,9 +72,11 @@ pub fn toBuffer(self: *Packet, buf: []u8) []u8 {
     buf[7] = @truncate(self.dest >> 8);
     buf[8] = @truncate(self.dest >> 0);
 
-    buf[9] = self.flagByte();
+    buf[9] = self.ttl;
 
-    buf[10] = self.len;
+    buf[10] = self.flagByte();
+
+    buf[11] = self.len;
 
     @memcpy(buf[HEADER_LEN .. HEADER_LEN + self.len], self.payload[0..self.len]);
 
@@ -106,6 +109,7 @@ test "to buffer" {
         .to = 0xBEEF,
         .origin = 0x1234,
         .dest = 0x5678,
+        .ttl = 3,
 
         .ack = false,
         .broadcast = true,
@@ -135,6 +139,8 @@ test "to buffer" {
         0x56,
         0x78,
 
+        0x03,
+
         0x48,
 
         0x02,
@@ -145,8 +151,8 @@ test "to buffer" {
         // We keep crc as null, so this enforces that
         // writing to buffer with a null crc first
         // calculates the crc
-        0xF1,
-        0xA8,
+        0xE3,
+        0x28,
     };
 
     try std.testing.expectEqualSlices(u8, &expected, packet_buf);

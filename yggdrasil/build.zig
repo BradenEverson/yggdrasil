@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const config = b.addOptions();
+    config.addOption(usize, "max_neighbors", b.option(usize, "max_neighbors", "Maximum number of direct neighbors per node") orelse 64);
+    config.addOption(usize, "max_queue_length", b.option(usize, "max_queue_length", "Maximum queued packets per neighbor") orelse 16);
+    mod.addOptions("config", config);
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -132,6 +137,7 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path("src/root.zig"),
                     .target = wasm_target,
                     .optimize = wasm_optimize,
+                    .imports = &.{.{ .name = "config", .module = config.createModule() }},
                 }) },
             },
         }),
