@@ -11,6 +11,7 @@ extern "env" fn js_write(node: u32, ptr: [*]const u8, len: usize) void;
 extern "env" fn js_read(node: u32, ptr: [*]u8, cap: usize) usize;
 extern "env" fn js_packet(node: u32, ptr: [*]const u8, len: usize) void;
 extern "env" fn js_panic(ptr: [*]const u8, len: usize) void;
+extern "env" fn js_neighbor_lost(node: u32, addr: u16) void;
 
 pub const panic = std.debug.FullPanic(wasmPanic);
 
@@ -25,6 +26,26 @@ pub const MAX_NODES: usize = 64;
 
 const RX_BUFFER_SIZE: usize = 256;
 
+/// Defaults mirror runtimes/stm32f446/src/main.zig
+const RETRANSMIT_TIMEOUT_MS: u32 = 4_000;
+const RETRANSMIT_JITTER_MS: u32 = 1_500;
+const ROOT_TIMEOUT_MS: u32 = 105_000;
+
+/// Simulated millisecond clock shared by every node, driven from JS.
+var sim_time_ms: u32 = 0;
+
+fn simClock() u32 {
+    return sim_time_ms;
+}
+
+fn neighborLost(addr: u16) void {
+    js_neighbor_lost(current, addr);
+}
+
+export fn ygg_set_time(ms: u32) void {
+    sim_time_ms = ms;
+}
+
 const Stats = struct {
     bytes_written: u64 = 0,
     bytes_read: u64 = 0,
@@ -33,7 +54,7 @@ const Stats = struct {
     packets_received: u64 = 0,
     packets_enqueued: u64 = 0,
     enqueue_failures: u64 = 0,
-    shim_transmits: u64 = 0,
+    request_writes: u64 = 0,
     raw_transmits: u64 = 0,
 };
 
@@ -111,6 +132,11 @@ export fn ygg_node_create(address: u16) i32 {
             .write_bytes_fn = writeBytes,
             .result_cb = packetReceived,
             .address = address,
+            .clock = simClock,
+            .neighbor_lost_cb = neighborLost,
+            .retransmit_timeout_ms = RETRANSMIT_TIMEOUT_MS,
+            .retransmit_jitter_ms = RETRANSMIT_JITTER_MS,
+            .root_timeout_ms = ROOT_TIMEOUT_MS,
         };
         node.ygg.buffer = &node.rx_buffer;
         slot.* = node;
@@ -132,6 +158,13 @@ export fn ygg_node_set_address(h: u32, address: u16) void {
     node.ygg.address = address;
 }
 
+export fn ygg_node_configure(h: u32, retransmit_timeout_ms: u32, retransmit_jitter_ms: u32, root_timeout_ms: u32) void {
+    const node = get(h) orelse return;
+    node.ygg.retransmit_timeout_ms = retransmit_timeout_ms;
+    node.ygg.retransmit_jitter_ms = retransmit_jitter_ms;
+    node.ygg.root_timeout_ms = root_timeout_ms;
+}
+
 export fn ygg_node_reset_parser(h: u32) void {
     const node = get(h) orelse return;
     node.ygg.state = .awaiting_header;
@@ -147,7 +180,7 @@ export fn ygg_read_stream(h: u32) i32 {
 export fn ygg_request_write(h: u32) i32 {
     const node = enter(h) orelse return -1;
     const wrote = node.ygg.requestWrite() catch return -2;
-    if (wrote) node.stats.shim_transmits += 1;
+    if (wrote) node.stats.request_writes += 1;
     return @intFromBool(wrote);
 }
 
@@ -176,6 +209,22 @@ export fn ygg_announce_root(h: u32) i32 {
     return 0;
 }
 
+export fn ygg_announce_topology(h: u32) i32 {
+    const node = enter(h) orelse return -1;
+    node.ygg.announceTopology();
+    return 0;
+}
+
+export fn ygg_set_topology_flooding(h: u32, enabled: bool) void {
+    const node = get(h) orelse return;
+    node.ygg.topology_flooding = enabled;
+}
+
+export fn ygg_set_topology_timeout(h: u32, timeout_ms: u32) void {
+    const node = get(h) orelse return;
+    node.ygg.topology_timeout_ms = timeout_ms;
+}
+
 export fn ygg_root_address(h: u32) i32 {
     const node = get(h) orelse return -1;
     const root = node.ygg.rootAddress() orelse return -1;
@@ -191,6 +240,11 @@ export fn ygg_send_to_root(
     const node = get(h) orelse return -1;
     const root = node.ygg.root orelse return 4;
     return ygg_send(h, root.addr, payload_ptr, payload_len, priority);
+}
+
+export fn ygg_drop_neighbor(h: u32, addr: u16) void {
+    const node = enter(h) orelse return;
+    node.ygg.dropNeighbor(addr);
 }
 
 export fn ygg_remove_route(h: u32, dest: u16) void {
@@ -248,10 +302,6 @@ export fn ygg_enqueue(
 
     node.stats.packets_enqueued += 1;
     return 0;
-}
-
-export fn ygg_shim_transmit_next(h: u32) i32 {
-    return ygg_request_write(h);
 }
 
 export fn ygg_transmit_raw(
@@ -370,8 +420,20 @@ fn writeSnapshot(w: *Writer, node: *Node) Writer.Error!void {
     try writeList(w, ft.forwarding_table[0..@min(ft.num_forwards, ft.forwarding_table.len)]);
     try w.writeAll("}");
 
-    try w.print(",\"is_root\":{},\"root\":", .{y.is_root});
+    try w.print(",\"is_root\":{},\"root_seq\":{d},\"root\":", .{ y.is_root, y.root_seq });
     try writeValue(w, y.root);
+    try w.writeAll(",\"pending_announce\":");
+    if (y.pending_announce) |*p| try writePacket(w, p) else try w.writeAll("null");
+    try w.print(",\"announce_at\":{d},\"now\":{d}", .{ y.announce_at, sim_time_ms });
+
+    try w.print(",\"topology_flooding\":{},\"topology_seq\":{d},\"topology\":[", .{ y.topology_flooding, y.topology_seq });
+    for (y.topology.nodes[0..y.topology.num_nodes], 0..) |*ls, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.print("{{\"addr\":{d},\"seq\":{d},\"heard_at\":{d},\"neighbors\":", .{ ls.addr, ls.seq, ls.heard_at });
+        try writeList(w, ls.links());
+        try w.writeAll("}");
+    }
+    try w.writeAll("]");
 
     try w.writeAll("}");
 }

@@ -84,6 +84,51 @@ pub const RootAnnouncement = struct {
     }
 };
 
+pub const TopologyInfo = struct {
+    origin: u16,
+    seq: u16,
+    neighbor_bytes: []const u8,
+
+    pub const HEADER_LEN: usize = 5;
+
+    pub fn parse(payload: []const u8) ?TopologyInfo {
+        if (payload.len < HEADER_LEN)
+            return null;
+
+        const n: usize = payload[4];
+        if (payload.len < HEADER_LEN + n * 2)
+            return null;
+
+        return .{
+            .origin = std.mem.readInt(u16, payload[0..2], .big),
+            .seq = std.mem.readInt(u16, payload[2..4], .big),
+            .neighbor_bytes = payload[HEADER_LEN..][0 .. n * 2],
+        };
+    }
+
+    pub fn count(info: TopologyInfo) usize {
+        return info.neighbor_bytes.len / 2;
+    }
+
+    pub fn neighbor(info: TopologyInfo, i: usize) u16 {
+        return std.mem.readInt(u16, info.neighbor_bytes[i * 2 ..][0..2], .big);
+    }
+
+    pub fn write(origin: u16, seq: u16, neighbors: []const u16, buf: []u8) error{NoSpaceLeft}![]u8 {
+        const len = HEADER_LEN + neighbors.len * 2;
+        if (neighbors.len > std.math.maxInt(u8) or buf.len < len)
+            return error.NoSpaceLeft;
+
+        std.mem.writeInt(u16, buf[0..2], origin, .big);
+        std.mem.writeInt(u16, buf[2..4], seq, .big);
+        buf[4] = @intCast(neighbors.len);
+        for (neighbors, 0..) |addr, i|
+            std.mem.writeInt(u16, buf[HEADER_LEN + i * 2 ..][0..2], addr, .big);
+
+        return buf[0..len];
+    }
+};
+
 pub const SensorReadingStream = struct {
     buf: []const u8,
 
@@ -351,6 +396,22 @@ test "Root announcement round trip" {
     try std.testing.expectEqual(@as(u16, 513), ann.seq);
     try std.testing.expectEqual(@as(u8, 4), ann.hops);
     try std.testing.expect(RootAnnouncement.parse(buf[0..4]) == null);
+}
+
+test "Topology info round trip" {
+    var buf: [32]u8 = undefined;
+    const bytes = try TopologyInfo.write(0x0102, 7, &.{ 0xBEEF, 3 }, &buf);
+    try std.testing.expectEqual(@as(usize, 9), bytes.len);
+
+    const info = TopologyInfo.parse(bytes).?;
+    try std.testing.expectEqual(@as(u16, 0x0102), info.origin);
+    try std.testing.expectEqual(@as(u16, 7), info.seq);
+    try std.testing.expectEqual(@as(usize, 2), info.count());
+    try std.testing.expectEqual(@as(u16, 0xBEEF), info.neighbor(0));
+    try std.testing.expectEqual(@as(u16, 3), info.neighbor(1));
+
+    try std.testing.expect(TopologyInfo.parse(bytes[0..8]) == null);
+    try std.testing.expectError(error.NoSpaceLeft, TopologyInfo.write(1, 1, &.{ 1, 2 }, buf[0..8]));
 }
 
 test "Sensor writer round trips through the stream" {

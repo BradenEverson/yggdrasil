@@ -5,55 +5,163 @@ const std = @import("std");
 
 pub const MAX_NEIGHBORS = @import("message_queue.zig").MAX_NEIGHBORS;
 
-pub const Node = struct {
-    address: u16,
-    connections: [MAX_NEIGHBORS]usize = undefined,
-    num_connections: usize = 0,
+pub const LinkState = struct {
+    addr: u16 = 0,
+    seq: u16 = 0,
+    neighbors: [MAX_NEIGHBORS]u16 = undefined,
+    num_neighbors: usize = 0,
+    heard_at: u32 = 0,
+    flood_pending: bool = false,
+    flood_at: u32 = 0,
 
-    pub fn connect(self: *Node, connection: usize) void {
-        self.connections[self.num_connections] = connection;
-        self.num_connections += 1;
+    pub fn links(ls: *const LinkState) []const u16 {
+        return ls.neighbors[0..ls.num_neighbors];
+    }
+
+    pub fn lists(ls: *const LinkState, addr: u16) bool {
+        return contains(ls.links(), addr);
     }
 };
 
-pub const SlotmapEntry = struct {
-    key: usize,
-    node: *Node,
+pub const Path = struct {
+    dest: u16,
+    first_hop: u16,
+    cost: u8,
 };
+
+fn contains(addrs: []const u16, addr: u16) bool {
+    for (addrs) |a| {
+        if (a == addr) return true;
+    }
+    return false;
+}
+
+pub fn seqNewer(a: u16, b: u16) bool {
+    return @as(i16, @bitCast(a -% b)) > 0;
+}
 
 pub const TopologyGraph = struct {
-    slotmap: [MAX_NEIGHBORS]Node = undefined,
-    num_registered: usize = 0,
+    nodes: [MAX_NEIGHBORS]LinkState = @splat(.{}),
+    num_nodes: usize = 0,
 
-    /// Initializes the topology graph with our address
-    pub fn init(me: usize) TopologyGraph {
-        var graph = TopologyGraph{};
-        graph.slotmap[graph.num_registered] = .{ .address = me };
-        graph.num_registered += 1;
-        return graph;
+    pub const MAX_VERTICES: usize = 2 * MAX_NEIGHBORS + 1;
+
+    pub const Error = error{TooManyNodes};
+
+    pub fn all(graph: *TopologyGraph) []LinkState {
+        return graph.nodes[0..graph.num_nodes];
     }
 
-    pub fn insert(graph: *TopologyGraph, addr: usize) void {
-        graph.slotmap[graph.num_registered] = .{ .address = addr };
-        graph.num_registered += 1;
-    }
-
-    pub fn get(graph: *TopologyGraph, addr: usize) ?SlotmapEntry {
-        for (0..graph.num_registered) |i| {
-            if (graph.slotmap[i].address == addr)
-                return .{ .key = i, .node = &graph.slotmap[i] };
+    pub fn get(graph: *TopologyGraph, addr: u16) ?*LinkState {
+        for (graph.all()) |*ls| {
+            if (ls.addr == addr) return ls;
         }
-
         return null;
     }
 
-    pub fn connect(
-        _: *TopologyGraph,
-        a: SlotmapEntry,
-        b: SlotmapEntry,
-    ) void {
-        a.node.connect(b.key);
-        b.node.connect(a.key);
+    fn getConst(graph: *const TopologyGraph, addr: u16) ?*const LinkState {
+        for (graph.nodes[0..graph.num_nodes]) |*ls| {
+            if (ls.addr == addr) return ls;
+        }
+        return null;
+    }
+
+    pub fn update(graph: *TopologyGraph, addr: u16, seq: u16, neighbors: []const u16, now: u32) Error!?*LinkState {
+        const entry = if (graph.get(addr)) |existing| blk: {
+            if (!seqNewer(seq, existing.seq))
+                return null;
+            break :blk existing;
+        } else blk: {
+            if (graph.num_nodes >= MAX_NEIGHBORS)
+                return error.TooManyNodes;
+            const fresh = &graph.nodes[graph.num_nodes];
+            graph.num_nodes += 1;
+            fresh.* = .{ .addr = addr };
+            break :blk fresh;
+        };
+
+        const n = @min(neighbors.len, MAX_NEIGHBORS);
+        @memcpy(entry.neighbors[0..n], neighbors[0..n]);
+        entry.num_neighbors = n;
+        entry.seq = seq;
+        entry.heard_at = now;
+        return entry;
+    }
+
+    pub fn remove(graph: *TopologyGraph, addr: u16) void {
+        for (graph.all(), 0..) |ls, i| {
+            if (ls.addr != addr) continue;
+            graph.num_nodes -= 1;
+            graph.nodes[i] = graph.nodes[graph.num_nodes];
+            return;
+        }
+    }
+
+    fn linked(graph: *const TopologyGraph, self_addr: u16, own: []const u16, u: u16, v: u16) bool {
+        if (u == self_addr) return contains(own, v);
+        if (v == self_addr) return contains(own, u);
+
+        const lu = graph.getConst(u);
+        const lv = graph.getConst(v);
+        const uv = if (lu) |ls| ls.lists(v) else false;
+        const vu = if (lv) |ls| ls.lists(u) else false;
+
+        if (lu != null and lv != null)
+            return uv and vu;
+        return uv or vu;
+    }
+
+    pub fn shortestPaths(graph: *const TopologyGraph, self_addr: u16, own: []const u16, out: []Path) usize {
+        const INF = std.math.maxInt(u16);
+
+        var addrs: [MAX_VERTICES]u16 = undefined;
+        var num: usize = 0;
+
+        const add = struct {
+            fn f(list: *[MAX_VERTICES]u16, len: *usize, addr: u16) void {
+                if (len.* >= MAX_VERTICES or contains(list[0..len.*], addr)) return;
+                list[len.*] = addr;
+                len.* += 1;
+            }
+        }.f;
+
+        add(&addrs, &num, self_addr);
+        for (own) |addr| add(&addrs, &num, addr);
+        for (graph.nodes[0..graph.num_nodes]) |*ls| {
+            add(&addrs, &num, ls.addr);
+            for (ls.links()) |addr| add(&addrs, &num, addr);
+        }
+
+        var dist: [MAX_VERTICES]u16 = @splat(INF);
+        var first: [MAX_VERTICES]u16 = undefined;
+        var done: [MAX_VERTICES]bool = @splat(false);
+        dist[0] = 0;
+
+        while (true) {
+            var best: ?usize = null;
+            for (0..num) |i| {
+                if (done[i] or dist[i] == INF) continue;
+                if (best == null or dist[i] < dist[best.?]) best = i;
+            }
+            const u = best orelse break;
+            done[u] = true;
+
+            for (0..num) |w| {
+                if (done[w] or dist[u] + 1 >= dist[w]) continue;
+                if (!graph.linked(self_addr, own, addrs[u], addrs[w])) continue;
+
+                dist[w] = dist[u] + 1;
+                first[w] = if (u == 0) addrs[w] else first[u];
+            }
+        }
+
+        var n: usize = 0;
+        for (1..num) |i| {
+            if (dist[i] == INF or n >= out.len) continue;
+            out[n] = .{ .dest = addrs[i], .first_hop = first[i], .cost = @intCast(@min(dist[i], std.math.maxInt(u8))) };
+            n += 1;
+        }
+        return n;
     }
 };
 
@@ -171,6 +279,16 @@ pub const ForwardingTable = struct {
         }
     }
 
+    pub fn removeRoutesExcept(ft: *ForwardingTable, keep: ?u16) void {
+        var i = ft.num_forwards;
+        while (i > 0) {
+            i -= 1;
+            if (keep != null and ft.forwarding_table[i].dest == keep.?) continue;
+            ft.num_forwards -= 1;
+            ft.forwarding_table[i] = ft.forwarding_table[ft.num_forwards];
+        }
+    }
+
     pub fn route(ft: *ForwardingTable, dest: u16) ?Route {
         if (ft.neighborByAddr(dest)) |neighbor|
             return .{ .neighbor = neighbor, .hops = 1 };
@@ -230,4 +348,52 @@ test "removing a neighbor drops routes through it" {
     try std.testing.expect(ft.nextHop(30) == null);
     try std.testing.expectEqual(@as(u16, 20), ft.nextHop(40).?.addr);
     try std.testing.expectEqual(@as(?usize, 0), ft.freeSlot());
+}
+
+fn pathTo(paths: []const Path, dest: u16) ?Path {
+    for (paths) |p| {
+        if (p.dest == dest) return p;
+    }
+    return null;
+}
+
+test "dijkstra finds shortest paths over advertised links" {
+    var graph = TopologyGraph{};
+    _ = try graph.update(2, 1, &.{ 1, 3, 5 }, 0);
+    _ = try graph.update(3, 1, &.{ 2, 4 }, 0);
+    _ = try graph.update(5, 1, &.{ 2, 4 }, 0);
+    _ = try graph.update(4, 1, &.{ 3, 5 }, 0);
+
+    var paths: [TopologyGraph.MAX_VERTICES]Path = undefined;
+    const n = graph.shortestPaths(1, &.{2}, &paths);
+    try std.testing.expectEqual(@as(usize, 4), n);
+
+    try std.testing.expectEqual(Path{ .dest = 2, .first_hop = 2, .cost = 1 }, pathTo(paths[0..n], 2).?);
+    try std.testing.expectEqual(Path{ .dest = 3, .first_hop = 2, .cost = 2 }, pathTo(paths[0..n], 3).?);
+    try std.testing.expectEqual(Path{ .dest = 4, .first_hop = 2, .cost = 3 }, pathTo(paths[0..n], 4).?);
+}
+
+test "links need both ends once both have advertised" {
+    var graph = TopologyGraph{};
+    _ = try graph.update(2, 1, &.{ 1, 3 }, 0);
+    var paths: [TopologyGraph.MAX_VERTICES]Path = undefined;
+    try std.testing.expect(pathTo(paths[0..graph.shortestPaths(1, &.{2}, &paths)], 3) != null);
+
+    _ = try graph.update(3, 1, &.{}, 0);
+    try std.testing.expect(pathTo(paths[0..graph.shortestPaths(1, &.{2}, &paths)], 3) == null);
+}
+
+test "stale advertisements are ignored" {
+    var graph = TopologyGraph{};
+    try std.testing.expect((try graph.update(2, 5, &.{1}, 0)) != null);
+    try std.testing.expect((try graph.update(2, 5, &.{ 1, 3 }, 0)) == null);
+    try std.testing.expect((try graph.update(2, 4, &.{ 1, 3 }, 0)) == null);
+    try std.testing.expectEqual(@as(usize, 1), graph.get(2).?.num_neighbors);
+
+    try std.testing.expect((try graph.update(2, 0, &.{ 1, 3 }, 0)) == null);
+    try std.testing.expect((try graph.update(2, 6, &.{ 1, 3 }, 0)) != null);
+    try std.testing.expectEqual(@as(usize, 2), graph.get(2).?.num_neighbors);
+
+    graph.remove(2);
+    try std.testing.expect(graph.get(2) == null);
 }

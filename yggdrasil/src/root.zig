@@ -18,6 +18,11 @@ const LARGEST_PACKET_SIZE: usize = 240;
 /// Scratch space for serializing an outgoing packet: header + max payload + crc
 const TX_BUFFER_SIZE: usize = 256;
 
+comptime {
+    if (1 + AppPacket.TopologyInfo.HEADER_LEN + routing.MAX_NEIGHBORS * 2 > NetworkPacket.MAX_PAYLOAD_SIZE)
+        @compileError("max_neighbors is too large for a full neighbor list to fit in one topology_info packet");
+}
+
 pub const SendError = error{ NoRoute, PayloadTooLarge } || MessageQueue.PushError;
 pub const NeighborError = ForwardingTable.Error;
 
@@ -99,6 +104,13 @@ pub const Yggdrasil = struct {
     pending_announce: ?NetworkPacket = null,
     announce_at: u32 = 0,
 
+    topology_flooding: bool = true,
+    topology: routing.TopologyGraph = .{},
+    topology_seq: u16 = 0,
+    topology_timeout_ms: u32 = 0,
+    own_flood_pending: bool = false,
+    own_flood_at: u32 = 0,
+
     /// scheduling mechanism to wrap around all neighbors' message queues
     pub fn requestWrite(ygg: *Yggdrasil) YggdrasilError!bool {
         const mq = &ygg.outgoing_packets;
@@ -107,6 +119,7 @@ pub const Yggdrasil = struct {
 
         ygg.dropUnresponsiveNeighbors(now);
         ygg.expireRoot(now);
+        ygg.expireTopology(now);
 
         for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
             if (!neighbor.ack_pending)
@@ -135,6 +148,12 @@ pub const Yggdrasil = struct {
                 try ygg.writePacket(&packet);
                 return true;
             }
+        }
+
+        if (ygg.nextFlood(now)) |flood| {
+            var packet = flood;
+            try ygg.writePacket(&packet);
+            return true;
         }
 
         const slot = mq.roundRobinTxWhere(Schedule{ .ygg = ygg, .now = now }, Schedule.ready) orelse return false;
@@ -229,6 +248,8 @@ pub const Yggdrasil = struct {
                 ygg.root = null;
         }
 
+        ygg.neighborsChanged(false);
+
         if (ygg.neighbor_lost_cb) |cb|
             cb(addr);
     }
@@ -240,13 +261,158 @@ pub const Yggdrasil = struct {
     }
 
     pub fn registerNeighbor(ygg: *Yggdrasil, addr: u16, slot: usize) NeighborError!*routing.MessageQueueMap {
+        const known = ygg.forwarding_table.neighborByAddr(addr) != null;
         const neighbor = try ygg.forwarding_table.registerNeighbor(addr, slot);
 
         const mq = &ygg.outgoing_packets;
         if (slot + 1 > mq.registered_nodes)
             mq.registered_nodes = slot + 1;
 
+        if (!known)
+            ygg.neighborsChanged(true);
+
         return neighbor;
+    }
+
+    pub fn announceTopology(ygg: *Yggdrasil) void {
+        if (!ygg.topology_flooding)
+            return;
+
+        ygg.topology_seq +%= 1;
+        ygg.own_flood_pending = true;
+        ygg.own_flood_at = ygg.currentTime();
+    }
+
+    fn neighborsChanged(ygg: *Yggdrasil, added: bool) void {
+        if (!ygg.topology_flooding)
+            return;
+
+        const now = ygg.currentTime();
+        ygg.topology_seq +%= 1;
+        ygg.own_flood_pending = true;
+        ygg.own_flood_at = now +% ygg.random(ygg.announce_jitter_ms);
+
+        if (added)
+            ygg.syncTopology();
+
+        ygg.recomputeRoutes();
+    }
+
+    fn syncTopology(ygg: *Yggdrasil) void {
+        if (!ygg.topology_flooding)
+            return;
+
+        const now = ygg.currentTime();
+        for (ygg.topology.all()) |*ls| {
+            if (ls.flood_pending) continue;
+            ls.flood_pending = true;
+            ls.flood_at = now +% ygg.random(ygg.announce_jitter_ms);
+        }
+    }
+
+    fn nextFlood(ygg: *Yggdrasil, now: u32) ?NetworkPacket {
+        if (!ygg.topology_flooding)
+            return null;
+
+        if (ygg.own_flood_pending and (ygg.clock == null or reached(now, ygg.own_flood_at))) {
+            ygg.own_flood_pending = false;
+
+            const ft = &ygg.forwarding_table;
+            var own: [routing.MAX_NEIGHBORS]u16 = undefined;
+            for (ft.output_map[0..ft.num_registered_output_map], 0..) |n, i| own[i] = n.addr;
+
+            return ygg.topologyPacket(ygg.address, ygg.topology_seq, own[0..ft.num_registered_output_map]);
+        }
+
+        for (ygg.topology.all()) |*ls| {
+            if (!ls.flood_pending or !(ygg.clock == null or reached(now, ls.flood_at)))
+                continue;
+
+            ls.flood_pending = false;
+            return ygg.topologyPacket(ls.addr, ls.seq, ls.links());
+        }
+
+        return null;
+    }
+
+    fn topologyPacket(ygg: *const Yggdrasil, origin: u16, seq: u16, neighbors: []const u16) NetworkPacket {
+        var packet = NetworkPacket{
+            .from = ygg.address,
+            .to = NetworkPacket.BROADCAST_ADDR,
+            .origin = origin,
+            .dest = NetworkPacket.BROADCAST_ADDR,
+            .broadcast = true,
+        };
+        packet.payload[0] = @backingInt(AppPacket.Opcode.topology_info);
+        const info = AppPacket.TopologyInfo.write(origin, seq, neighbors, packet.payload[1..]) catch unreachable;
+        packet.len = @intCast(1 + info.len);
+        return packet;
+    }
+
+    fn handleTopologyInfo(ygg: *Yggdrasil, from: u16, payload: []const u8) void {
+        if (!ygg.topology_flooding)
+            return;
+
+        const info = AppPacket.TopologyInfo.parse(payload) orelse return;
+        _ = ygg.learnNeighbor(from) catch {};
+
+        if (info.origin == ygg.address) {
+            if (routing.seqNewer(info.seq, ygg.topology_seq)) {
+                ygg.topology_seq = info.seq;
+                ygg.announceTopology();
+            }
+            return;
+        }
+
+        var neighbors: [routing.MAX_NEIGHBORS]u16 = undefined;
+        const n = @min(info.count(), neighbors.len);
+        for (0..n) |i| neighbors[i] = info.neighbor(i);
+
+        const now = ygg.currentTime();
+        const entry = (ygg.topology.update(info.origin, info.seq, neighbors[0..n], now) catch return) orelse return;
+        entry.flood_pending = true;
+        entry.flood_at = now +% ygg.random(ygg.announce_jitter_ms);
+
+        ygg.recomputeRoutes();
+    }
+
+    fn expireTopology(ygg: *Yggdrasil, at: u32) void {
+        if (ygg.clock == null or ygg.topology_timeout_ms == 0)
+            return;
+
+        var changed = false;
+        var i = ygg.topology.num_nodes;
+        while (i > 0) {
+            i -= 1;
+            const ls = ygg.topology.nodes[i];
+            if (at -% ls.heard_at < ygg.topology_timeout_ms) continue;
+            ygg.topology.remove(ls.addr);
+            changed = true;
+        }
+
+        if (changed)
+            ygg.recomputeRoutes();
+    }
+
+    pub fn recomputeRoutes(ygg: *Yggdrasil) void {
+        if (!ygg.topology_flooding)
+            return;
+
+        const ft = &ygg.forwarding_table;
+        const root_addr: ?u16 = if (ygg.root) |r| r.addr else null;
+        ft.removeRoutesExcept(root_addr);
+
+        var own: [routing.MAX_NEIGHBORS]u16 = undefined;
+        for (ft.output_map[0..ft.num_registered_output_map], 0..) |n, i| own[i] = n.addr;
+
+        var paths: [routing.TopologyGraph.MAX_VERTICES]routing.Path = undefined;
+        const n = ygg.topology.shortestPaths(ygg.address, own[0..ft.num_registered_output_map], &paths);
+
+        for (paths[0..n]) |path| {
+            if (path.cost < 2 or root_addr == path.dest) continue;
+            const via = ft.neighborByAddr(path.first_hop) orelse continue;
+            ft.setRoute(path.dest, via.mq_idx, path.cost) catch break;
+        }
     }
 
     pub fn learnNeighbor(ygg: *Yggdrasil, addr: u16) NeighborError!*routing.MessageQueueMap {
@@ -359,6 +525,8 @@ pub const Yggdrasil = struct {
             .{ .root = ann.root, .seq = ann.seq, .hops = hops },
             now +% ygg.random(ygg.announce_jitter_ms),
         );
+
+        ygg.recomputeRoutes();
     }
 
     fn expireRoot(ygg: *Yggdrasil, at: u32) void {
@@ -371,6 +539,7 @@ pub const Yggdrasil = struct {
 
         ygg.forwarding_table.removeRoute(current.addr);
         ygg.root = null;
+        ygg.recomputeRoutes();
     }
 
     pub fn sendApp(ygg: *Yggdrasil, dest: u16, app: AppPacket, priority: u8) SendError!void {
@@ -409,8 +578,10 @@ pub const Yggdrasil = struct {
         const known = ygg.forwarding_table.neighborByAddr(addr) != null;
         const neighbor = try ygg.learnNeighbor(addr);
 
-        if (known)
+        if (known) {
             resetLink(neighbor);
+            ygg.syncTopology();
+        }
 
         var reply = NetworkPacket{
             .from = ygg.address,
@@ -451,6 +622,7 @@ pub const Yggdrasil = struct {
             switch (app.op) {
                 .hello => ygg.replyHello(packet.from) catch {},
                 .im_a_root => ygg.handleRootAnnouncement(packet.from, app.payload),
+                .topology_info => ygg.handleTopologyInfo(packet.from, app.payload),
                 else => {},
             }
         }
@@ -668,6 +840,7 @@ const TestNet = struct {
             .write_bytes_fn = write,
             .result_cb = cb,
             .address = addr,
+            .topology_flooding = false,
         };
     }
 
@@ -906,6 +1079,152 @@ test "root announcements build routes across hops and set ttl from them" {
     try std.testing.expectEqual(@as(u16, 1), got.dest);
     try std.testing.expectEqual(@as(u8, 1), got.ttl);
     try std.testing.expectEqualSlices(u8, "r", got.body());
+}
+
+const Mesh = struct {
+    nodes: []const *Yggdrasil,
+    links: []const [2]u16,
+
+    fn hears(mesh: Mesh, a: u16, b: u16) bool {
+        for (mesh.links) |l| {
+            if ((l[0] == a and l[1] == b) or (l[0] == b and l[1] == a)) return true;
+        }
+        return false;
+    }
+
+    fn broadcast(mesh: Mesh, from: *Yggdrasil) !void {
+        for (mesh.nodes) |n| {
+            if (n != from and mesh.hears(from.address, n.address)) try TestNet.hear(n);
+        }
+    }
+
+    fn hello(mesh: Mesh, ygg: *Yggdrasil) !void {
+        try ygg.sayHello();
+        try mesh.broadcast(ygg);
+    }
+
+    fn settle(mesh: Mesh) !void {
+        for (0..10_000) |_| {
+            var any = false;
+            for (mesh.nodes) |n| {
+                if (try n.requestWrite()) {
+                    any = true;
+                    try mesh.broadcast(n);
+                }
+            }
+            if (!any) return;
+        }
+        return error.NeverSettled;
+    }
+
+    fn cut(mesh: Mesh, a: *Yggdrasil, b: *Yggdrasil) void {
+        _ = mesh;
+        a.dropNeighbor(b.address);
+        b.dropNeighbor(a.address);
+    }
+};
+
+fn meshNode(addr: u16) Yggdrasil {
+    var ygg = TestNet.node(addr);
+    ygg.topology_flooding = true;
+    return ygg;
+}
+
+test "link-state flooding gives every node routes across the mesh" {
+    var n1 = meshNode(1);
+    var n2 = meshNode(2);
+    var n3 = meshNode(3);
+    var n4 = meshNode(4);
+    var mesh = Mesh{
+        .nodes = &.{ &n1, &n2, &n3, &n4 },
+        .links = &.{ .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 } },
+    };
+
+    for (mesh.nodes) |n| try mesh.hello(n);
+    try mesh.settle();
+
+    try std.testing.expectEqual(@as(u16, 2), n1.forwarding_table.route(4).?.neighbor.addr);
+    try std.testing.expectEqual(@as(u8, 3), n1.forwarding_table.route(4).?.hops);
+    try std.testing.expectEqual(@as(u8, 2), n1.forwarding_table.route(3).?.hops);
+    try std.testing.expectEqual(@as(u16, 3), n4.forwarding_table.route(1).?.neighbor.addr);
+    try std.testing.expectEqual(@as(u8, 3), n4.forwarding_table.route(1).?.hops);
+    try std.testing.expectEqual(@as(u16, 3), n2.forwarding_table.route(4).?.neighbor.addr);
+    try std.testing.expectEqual(@as(u16, 2), n3.forwarding_table.route(1).?.neighbor.addr);
+
+    TestNet.delivered = null;
+    try n1.send(4, "far", MessageQueue.PRIORITY_LOW);
+    try mesh.settle();
+
+    const got = TestNet.delivered.?;
+    try std.testing.expectEqual(@as(u16, 1), got.origin);
+    try std.testing.expectEqual(@as(u16, 4), got.dest);
+    try std.testing.expectEqualSlices(u8, "far", got.body());
+
+    TestNet.delivered = null;
+    try n4.send(1, "back", MessageQueue.PRIORITY_LOW);
+    try mesh.settle();
+    try std.testing.expectEqual(@as(u16, 1), TestNet.delivered.?.dest);
+    try std.testing.expectEqualSlices(u8, "back", TestNet.delivered.?.body());
+}
+
+test "routes move to the next shortest path when a link breaks" {
+    var n1 = meshNode(1);
+    var n2 = meshNode(2);
+    var n3 = meshNode(3);
+    var n4 = meshNode(4);
+    var n5 = meshNode(5);
+    var mesh = Mesh{
+        .nodes = &.{ &n1, &n2, &n3, &n4, &n5 },
+        .links = &.{ .{ 1, 2 }, .{ 2, 3 }, .{ 1, 4 }, .{ 4, 5 }, .{ 5, 3 } },
+    };
+
+    for (mesh.nodes) |n| try mesh.hello(n);
+    try mesh.settle();
+
+    try std.testing.expectEqual(@as(u16, 2), n1.forwarding_table.route(3).?.neighbor.addr);
+    try std.testing.expectEqual(@as(u8, 2), n1.forwarding_table.route(3).?.hops);
+
+    mesh.links = &.{ .{ 1, 2 }, .{ 1, 4 }, .{ 4, 5 }, .{ 5, 3 } };
+    mesh.cut(&n2, &n3);
+    try mesh.settle();
+
+    try std.testing.expectEqual(@as(u16, 4), n1.forwarding_table.route(3).?.neighbor.addr);
+    try std.testing.expectEqual(@as(u8, 3), n1.forwarding_table.route(3).?.hops);
+    try std.testing.expectEqual(@as(u16, 1), n2.forwarding_table.route(3).?.neighbor.addr);
+    try std.testing.expectEqual(@as(u8, 4), n2.forwarding_table.route(3).?.hops);
+
+    TestNet.delivered = null;
+    try n2.send(3, "around", MessageQueue.PRIORITY_LOW);
+    try mesh.settle();
+    try std.testing.expectEqual(@as(u16, 3), TestNet.delivered.?.dest);
+    try std.testing.expectEqualSlices(u8, "around", TestNet.delivered.?.body());
+}
+
+test "a rebooted node outbids its own stale advertisement" {
+    var n1 = meshNode(1);
+    var n2 = meshNode(2);
+    var n3 = meshNode(3);
+    var mesh = Mesh{
+        .nodes = &.{ &n1, &n2, &n3 },
+        .links = &.{ .{ 1, 2 }, .{ 2, 3 } },
+    };
+
+    for (mesh.nodes) |n| try mesh.hello(n);
+    for (0..4) |_| {
+        n1.announceTopology();
+        try mesh.settle();
+    }
+    const before = n1.topology_seq;
+    try std.testing.expectEqual(before, n3.topology.get(1).?.seq);
+
+    n1 = meshNode(1);
+    try mesh.hello(&n1);
+    try mesh.settle();
+
+    try std.testing.expect(routing.seqNewer(n1.topology_seq, before));
+    try std.testing.expectEqual(n1.topology_seq, n3.topology.get(1).?.seq);
+    try std.testing.expectEqual(@as(u8, 2), n1.forwarding_table.route(3).?.hops);
+    try std.testing.expectEqual(@as(u8, 2), n3.forwarding_table.route(1).?.hops);
 }
 
 test "packets are dropped when their hop limit runs out" {
