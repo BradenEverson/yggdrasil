@@ -5,7 +5,6 @@ const node_config = @import("node_config");
 const hal = @import("hal.zig");
 const Rylr = @import("drivers/rylr896.zig");
 const bme688 = @import("drivers/bme688.zig");
-const ina260 = @import("drivers/ina260.zig");
 
 const debug: hal.uart.Uart = .usart2;
 const lora_uart: hal.uart.Uart = .usart1;
@@ -114,7 +113,6 @@ fn app() void {
     });
 
     var sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, .{}) catch |e| fail("BME688 init", e);
-    const power = ina260.Ina260.init(.i2c1, ina260.ADDR_DEFAULT, .x16) catch |e| fail("INA260 init", e);
 
     hal.uart.writeStr(debug, "Restarting LoRA Module\r\n");
 
@@ -198,28 +196,21 @@ fn app() void {
 
         if (reached(now, next_sample)) {
             next_sample = now +% SAMPLE_PERIOD_MS;
-            sample(&ygg, &sensor, &power);
+            sample(&ygg, &sensor);
         }
     }
 }
 
-fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688, power: *const ina260.Ina260) void {
+fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688) void {
     const r = sensor.measure() catch |e| {
         hal.uart.print(debug, "measure failed: {s}\r\n", .{@errorName(e)});
         return;
     };
 
-    const power_mw: u16 = if (power.readPowerMw()) |mw|
-        @intCast(@min(mw, std.math.maxInt(u16)))
-    else |e| blk: {
-        hal.uart.print(debug, "read power failed: {s}\r\n", .{@errorName(e)});
-        break :blk 0;
-    };
-
     var readings_buf: [yggdrasil.NetworkPacket.MAX_PAYLOAD_SIZE - 1]u8 = undefined;
     var readings = yggdrasil.AppPacket.SensorReadingWriter{ .buf = &readings_buf };
 
-    addReadings(&readings, r, power_mw) catch |e| {
+    addReadings(&readings, r) catch |e| {
         hal.uart.print(debug, "encode failed: {s}\r\n", .{@errorName(e)});
         return;
     };
@@ -231,13 +222,11 @@ fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688, power: *const ina2
     };
 }
 
-fn addReadings(readings: *yggdrasil.AppPacket.SensorReadingWriter, r: bme688.Reading, power_mw: u16) error{NoSpaceLeft}!void {
+fn addReadings(readings: *yggdrasil.AppPacket.SensorReadingWriter, r: bme688.Reading) error{NoSpaceLeft}!void {
     try readings.add("t", .{ .float32 = r.temperatureF() });
     try readings.add("p", .{ .float32 = r.pressureHpa() });
     try readings.add("h", .{ .float32 = r.humidity_pct });
 
     if (r.gas_valid and r.heater_stable)
         try readings.add("g", .{ .float32 = r.gas_resistance_ohm });
-
-    try readings.add("w", .{ .uint16 = power_mw });
 }
