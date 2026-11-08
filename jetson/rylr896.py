@@ -6,6 +6,9 @@ class RYLR896:
         self.ser = serial.Serial(port, baud, timeout=0.5)
         self.on_receive = None
         self._buffer = bytearray()
+        self._inbox = []
+        self._response = None
+        self._sending = False
 
     def send_command(self, cmd, delay=0.2):
         full_cmd = f"{cmd}\r\n"
@@ -29,6 +32,11 @@ class RYLR896:
         while self._try_parse_buffer():
             pass
 
+        if not self._sending:
+            inbox, self._inbox = self._inbox, []
+            for message in inbox:
+                self._deliver(message)
+
     def _try_parse_buffer(self):
         buf = self._buffer
         if not buf:
@@ -41,7 +49,11 @@ class RYLR896:
             line = bytes(buf[:newline_idx])
             del buf[:newline_idx + 2]
             text = line.decode(errors="replace").strip()
-            if text:
+            if text.startswith("+OK") or text.startswith("+ERR"):
+                self._response = text
+                if text.startswith("+ERR"):
+                    print(f"Module: {text}")
+            elif text:
                 print(f"Module: {text}")
             return True
 
@@ -101,13 +113,15 @@ class RYLR896:
 
 
     def _dispatch_message(self, address, length, raw_data, rssi, snr):
-        message = {
+        self._inbox.append({
             "address": address,
             "length": length,
             "data": raw_data,
             "rssi": rssi,
             "snr": snr,
-        }
+        })
+
+    def _deliver(self, message):
         if self.on_receive:
             try:
                 self.on_receive(message)
@@ -122,6 +136,25 @@ class RYLR896:
         cmd = f"AT+SEND={address},{len(data_bytes)},".encode() + data_bytes
         self.ser.write(cmd + b"\r\n")
         print(f"Sending: {cmd!r}")
+
+    def send_data(self, address, data, timeout=2.0):
+        self._sending = True
+        try:
+            self.poll()
+            self._response = None
+            self.ser.write(f"AT+SEND={address},{len(data)},".encode() + bytes(data) + b"\r\n")
+
+            deadline = time.monotonic() + timeout
+            while self._response is None and time.monotonic() < deadline:
+                self.poll()
+                time.sleep(0.005)
+
+            if self._response is None:
+                print("Module: timed out waiting for +OK")
+                return False
+            return self._response.startswith("+OK")
+        finally:
+            self._sending = False
 
     def close(self):
         self.ser.close()

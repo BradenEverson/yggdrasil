@@ -151,6 +151,21 @@ pub fn build(b: *std.Build) void {
     if (wasm_enabled) b.getInstallStep().dependOn(&install_wasm.step);
     b.addNamedLazyPath("wasm", wasm_exe.getEmittedBin());
 
+    // Shared library with a C ABI for host-side nodes
+    const c_lib = b.addLibrary(.{
+        .name = "yggdrasil",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yggdrasil", .module = mod }},
+        }),
+    });
+    const install_c_lib = b.addInstallArtifact(c_lib, .{});
+    const c_lib_step = b.step("clib", "Build the C ABI shared library (used by jetson/yggdrasil.py)");
+    c_lib_step.dependOn(&install_c_lib.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
