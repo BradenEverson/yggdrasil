@@ -67,7 +67,7 @@ export fn ygg_init(
         .neighbor_lost_cb = onNeighborLost,
         .retransmit_timeout_ms = 4_000,
         .retransmit_jitter_ms = 1_500,
-        .root_timeout_ms = 105_000,
+        .root_timeout_ms = 450_000,
         .is_root = is_root,
     };
     node.buffer = &rx_buffer;

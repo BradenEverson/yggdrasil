@@ -482,6 +482,20 @@ pub const Yggdrasil = struct {
         ygg.announce_at = at;
     }
 
+    fn answerHello(ygg: *Yggdrasil) void {
+        if (ygg.pending_announce != null)
+            return;
+
+        const ann: AppPacket.RootAnnouncement = if (ygg.is_root)
+            .{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 }
+        else if (ygg.root) |current|
+            .{ .root = current.addr, .seq = current.seq, .hops = current.hops }
+        else
+            return;
+
+        ygg.queueAnnouncement(ann, ygg.currentTime() +% ygg.random(ygg.announce_jitter_ms));
+    }
+
     fn handleRootAnnouncement(ygg: *Yggdrasil, from: u16, payload: []const u8) void {
         if (ygg.is_root)
             return;
@@ -627,7 +641,10 @@ pub const Yggdrasil = struct {
 
         if (AppPacket.parse(packet.body())) |app| {
             switch (app.op) {
-                .hello => ygg.replyHello(packet.from) catch {},
+                .hello => {
+                    ygg.replyHello(packet.from) catch {};
+                    ygg.answerHello();
+                },
                 .im_a_root => ygg.handleRootAnnouncement(packet.from, app.payload),
                 .topology_info => ygg.handleTopologyInfo(packet.from, app.payload),
                 else => {},
@@ -1309,6 +1326,29 @@ test "any frame from a direct root keeps it alive" {
     TestClock.time = 1900;
     _ = try b.requestWrite();
     try std.testing.expect(b.rootAddress() == null);
+}
+
+test "hello is answered with a root announcement" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(1);
+    var b = TestClock.node(2);
+    var c = TestClock.node(3);
+    a.is_root = true;
+
+    a.announceRoot();
+    try TestNet.transmit(&a, &.{&b});
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    b.pending_announce = null;
+
+    try c.sayHello();
+    try TestNet.hear(&b);
+    try std.testing.expect(b.pending_announce != null);
+
+    TestClock.time = b.announce_at;
+    try TestNet.transmit(&b, &.{&c});
+    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
 }
 
 test "root routes expire without fresh announcements" {
