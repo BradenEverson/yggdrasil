@@ -6,7 +6,7 @@ const hal = @import("../hal.zig");
 uart: hal.uart.Uart,
 rx_buffer: []u8,
 tx_buffer: []u8,
-timeout_ms: u32 = 2000,
+timeout_ms: u32 = 5000,
 line_state: LineState = .text,
 line_len: usize = 0,
 rcv_remaining: usize = 0,

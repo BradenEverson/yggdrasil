@@ -11,6 +11,7 @@ from rylr896 import RYLR896
 NETWORK_ID = 5
 RADIO_BROADCAST_ADDR = 0
 ROOT_ANNOUNCE_PERIOD_S = 30.0
+ROOT_ANNOUNCE_JITTER_S = 5.0
 TX_JITTER_S = 0.3
 
 KNOWN_READINGS = {
@@ -113,12 +114,16 @@ class Hub(object):
         print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}): {pretty}")
         self.log.write(row)
 
+    @staticmethod
+    def announce_delay():
+        return ROOT_ANNOUNCE_PERIOD_S + random.uniform(-ROOT_ANNOUNCE_JITTER_S, ROOT_ANNOUNCE_JITTER_S)
+
     def run(self):
         self.node.tick()
         self.node.say_hello()
         self.node.announce_root()
 
-        next_announce = time.monotonic() + ROOT_ANNOUNCE_PERIOD_S
+        next_announce = time.monotonic() + self.announce_delay()
         next_write = time.monotonic()
         known_neighbors = []
 
@@ -130,7 +135,7 @@ class Hub(object):
             now = time.monotonic()
             if now >= next_announce:
                 self.node.announce_root()
-                next_announce = now + ROOT_ANNOUNCE_PERIOD_S
+                next_announce = now + self.announce_delay()
 
             if now >= next_write:
                 self.node.request_write()

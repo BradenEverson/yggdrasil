@@ -16,6 +16,7 @@ const YGG_RX_SIZE = 64;
 const NETWORK_ID: u16 = 5;
 const NODE_ADDR: u16 = node_config.node_addr;
 const SAMPLE_PERIOD_MS: u32 = 30_000;
+const SAMPLE_JITTER_MS: u32 = 3_000;
 const ROOT_TIMEOUT_MS: u32 = 105_000;
 const HELLO_PERIOD_MS: u32 = 10_000;
 const HELLO_JITTER_MS: u32 = 2_000;
@@ -195,7 +196,7 @@ fn app() void {
         }
 
         if (reached(now, next_sample)) {
-            next_sample = now +% SAMPLE_PERIOD_MS;
+            next_sample = now +% SAMPLE_PERIOD_MS -% SAMPLE_JITTER_MS +% random(2 * SAMPLE_JITTER_MS);
             sample(&ygg, &sensor);
         }
     }

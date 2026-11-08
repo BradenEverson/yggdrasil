@@ -529,6 +529,13 @@ pub const Yggdrasil = struct {
         ygg.recomputeRoutes();
     }
 
+    fn refreshDirectRoot(ygg: *Yggdrasil, from: u16) void {
+        if (ygg.root) |*current| {
+            if (current.addr == from and current.via == from)
+                current.heard_at = ygg.currentTime();
+        }
+    }
+
     fn expireRoot(ygg: *Yggdrasil, at: u32) void {
         if (ygg.clock == null or ygg.root_timeout_ms == 0)
             return;
@@ -633,6 +640,8 @@ pub const Yggdrasil = struct {
     /// Handles network level packets that are relevant to routing tables, forwarding,
     /// etc. Passes through most (maybe all?) messages to the app level callback as well
     pub fn handle_network_packet(ygg: *Yggdrasil, packet: NetworkPacket) void {
+        ygg.refreshDirectRoot(packet.from);
+
         if (packet.broadcast) {
             ygg.handleBroadcast(packet);
             return;
@@ -1275,6 +1284,31 @@ test "newer sequence numbers win, shorter paths win within a sequence" {
     try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
     try std.testing.expectEqual(@as(u8, 8), c.root.?.hops);
     try std.testing.expectEqual(@as(u8, 8), c.forwarding_table.route(1).?.hops);
+}
+
+test "any frame from a direct root keeps it alive" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(1);
+    var b = TestClock.node(2);
+    a.is_root = true;
+    b.root_timeout_ms = 1000;
+
+    a.announceRoot();
+    try TestNet.transmit(&a, &.{&b});
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+
+    TestClock.time = 900;
+    try a.sayHello();
+    try TestNet.hear(&b);
+
+    TestClock.time = 1800;
+    _ = try b.requestWrite();
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+
+    TestClock.time = 1900;
+    _ = try b.requestWrite();
+    try std.testing.expect(b.rootAddress() == null);
 }
 
 test "root routes expire without fresh announcements" {
