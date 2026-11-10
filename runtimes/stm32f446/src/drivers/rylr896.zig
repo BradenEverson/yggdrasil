@@ -16,6 +16,9 @@ inbox_head: u32 = 0,
 inbox_tail: u32 = 0,
 inbox_dropped: u32 = 0,
 
+params: ?Parameters = null,
+power_dbm: ?u4 = null,
+
 received: u32 = 0,
 last_rx: [FRAME_PEEK]u8 = undefined,
 last_rx_len: usize = 0,
@@ -245,13 +248,18 @@ pub fn wake(self: *Self) RylrError!void {
     while (attempt < WAKE_ATTEMPTS) : (attempt += 1) {
         self.line_len = 0;
         hal.uart.writeStr(self.uart, "AT\r\n");
-        self.awaitReply(WAKE_TIMEOUT_MS, true) catch {};
+        self.awaitReply(WAKE_TIMEOUT_MS, true) catch continue;
         self.line_len = 0;
-        self.command("AT+MODE=0\r\n", WAKE_TIMEOUT_MS) catch continue;
+        self.restore() catch continue;
         return;
     }
 
     return RylrError.Timeout;
+}
+
+fn restore(self: *Self) RylrError!void {
+    if (self.params) |params| try self.setParameters(params);
+    if (self.power_dbm) |dbm| try self.setPower(dbm);
 }
 
 pub fn setParameters(self: *Self, params: Parameters) RylrError!void {
@@ -262,6 +270,7 @@ pub fn setParameters(self: *Self, params: Parameters) RylrError!void {
     ) catch return RylrError.BufferTooSmall;
 
     try self.send(msg);
+    self.params = params;
 }
 
 pub fn setPower(self: *Self, dbm: u4) RylrError!void {
@@ -272,6 +281,7 @@ pub fn setPower(self: *Self, dbm: u4) RylrError!void {
     ) catch return RylrError.BufferTooSmall;
 
     try self.send(msg);
+    self.power_dbm = dbm;
 }
 
 pub fn setNetwork(self: *Self, net: u16) RylrError!void {

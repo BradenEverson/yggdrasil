@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     node_config.addOption(u3, "cr", b.option(u3, "cr", "LoRa coding rate 1-4, must match the whole network") orelse 1);
     node_config.addOption(u8, "preamble", b.option(u8, "preamble", "LoRa programmed preamble 4-7") orelse 4);
     node_config.addOption(u4, "tx_power", b.option(u4, "tx_power", "RF output power in dBm 0-15") orelse 15);
-    node_config.addOption(u32, "radio_wake_ms", b.option(u32, "radio_wake_ms", "Lead time to wake the radio before a window") orelse 100);
+    node_config.addOption(u32, "radio_wake_ms", b.option(u32, "radio_wake_ms", "Lead time to wake the radio before a window") orelse 250);
     node_config.addOption(bool, "log", b.option(bool, "log", "Print debug output on USART2") orelse true);
     node_config.addOption(bool, "radio_sleep", b.option(bool, "radio_sleep", "Put the radio and MCU to sleep between windows") orelse true);
     node_config.addOption(bool, "trace", b.option(bool, "trace", "Log every frame sent and received") orelse false);
