@@ -50,6 +50,8 @@ def _load(path):
     lib.ygg_init.restype = None
     lib.ygg_configure_power.argtypes = [ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint8]
     lib.ygg_configure_power.restype = None
+    lib.ygg_set_root_beacon.argtypes = [ctypes.c_uint32]
+    lib.ygg_set_root_beacon.restype = None
     lib.ygg_set_root_seq.argtypes = [ctypes.c_uint16]
     lib.ygg_set_root_seq.restype = None
     lib.ygg_idle_for.argtypes = []
@@ -121,6 +123,9 @@ class Node(object):
 
     def configure_power(self, period_ms, spreading_factor, bandwidth_hz, coding_rate, preamble):
         self._lib.ygg_configure_power(period_ms, spreading_factor, bandwidth_hz, coding_rate, preamble)
+
+    def set_root_beacon(self, period_ms):
+        self._lib.ygg_set_root_beacon(period_ms)
 
     def set_root_seq(self, seq):
         self._lib.ygg_set_root_seq(seq & 0xFFFF)

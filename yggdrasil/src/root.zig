@@ -132,6 +132,10 @@ pub const Yggdrasil = struct {
     awake_until: u32 = 0,
     joining_until: ?u32 = null,
     next_join_at: ?u32 = null,
+    hellos_left: u8 = 0,
+    next_hello_at: u32 = 0,
+    ever_rooted: bool = false,
+    next_beacon_at: ?u32 = null,
     join_backoff_ms: u32 = 0,
     lost_root: ?RootRoute = null,
     lost_root_at: u32 = 0,
@@ -153,6 +157,7 @@ pub const Yggdrasil = struct {
             ygg.expireNeighbors(now);
             if (try ygg.maintainJoin(now))
                 return true;
+            ygg.maintainBeacon(now);
             ygg.refill();
             ygg.maintainReport(now);
         }
@@ -576,9 +581,9 @@ pub const Yggdrasil = struct {
         const ft = &ygg.forwarding_table;
         for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
             if (neighbor.hello_pending) {
-                resetLink(neighbor);
                 const hello = ygg.directPacket(neighbor.addr, .hello);
                 if (mq.pushMessage(neighbor.mq_idx, hello, MessageQueue.PRIORITY_HIGH)) |_| {
+                    resetLink(neighbor);
                     neighbor.hello_pending = false;
                 } else |_| {}
             }
@@ -607,12 +612,20 @@ pub const Yggdrasil = struct {
             return false;
         }
 
+        const p = ygg.power.?;
+
         if (ygg.joining_until) |until| {
-            if (!reached(now, until))
+            if (reached(now, until)) {
+                ygg.joining_until = null;
+                ygg.finishJoin(now);
                 return false;
-            ygg.joining_until = null;
-            ygg.finishJoin(now);
-            return false;
+            }
+            if (ygg.hellos_left == 0 or !reached(now, ygg.next_hello_at))
+                return false;
+            ygg.hellos_left -= 1;
+            ygg.next_hello_at = now +% p.helloSpacingMs() +% ygg.joinJitter();
+            try ygg.sayHello();
+            return true;
         }
 
         const start = ygg.next_join_at orelse blk: {
@@ -623,9 +636,24 @@ pub const Yggdrasil = struct {
         if (!reached(now, start))
             return false;
 
-        ygg.joining_until = now +% ygg.power.?.scanMs();
+        ygg.joining_until = now +% p.scanMs();
+        ygg.hellos_left = @max(p.join_hellos, 1) - 1;
+        ygg.next_hello_at = now +% p.helloSpacingMs() +% ygg.joinJitter();
         try ygg.sayHello();
         return true;
+    }
+
+    fn maintainBeacon(ygg: *Yggdrasil, now: u32) void {
+        const p = ygg.power.?;
+        if (!ygg.is_root or p.root_beacon_ms == 0)
+            return;
+
+        const due = ygg.next_beacon_at orelse now;
+        if (!reached(now, due) or ygg.pending_announce != null)
+            return;
+
+        ygg.queueAnnouncement(.{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 }, now);
+        ygg.next_beacon_at = now +% p.root_beacon_ms +% ygg.random(p.root_beacon_ms / 4);
     }
 
     fn finishJoin(ygg: *Yggdrasil, now: u32) void {
@@ -638,7 +666,8 @@ pub const Yggdrasil = struct {
 
         const first = @max(p.periodMs(), 4 * p.windowMs());
         const step = if (ygg.join_backoff_ms == 0) first else ygg.join_backoff_ms *| 2;
-        ygg.join_backoff_ms = @min(step, @max(p.join_backoff_max_ms, first));
+        const cap = if (ygg.ever_rooted) p.join_backoff_max_ms else p.join_backoff_fresh_max_ms;
+        ygg.join_backoff_ms = @min(step, @max(cap, first));
         ygg.next_join_at = now +% ygg.join_backoff_ms +% ygg.joinJitter();
     }
 
@@ -1138,7 +1167,9 @@ pub const Yggdrasil = struct {
             if (changed)
                 ygg.markAnnounce(from, hops);
             ygg.joining_until = null;
+            ygg.hellos_left = 0;
             ygg.join_backoff_ms = 0;
+            ygg.ever_rooted = true;
             ygg.lost_root = null;
             ygg.alignWindow(now);
         }

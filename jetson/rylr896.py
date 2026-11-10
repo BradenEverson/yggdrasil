@@ -9,6 +9,8 @@ class RYLR896:
         self._inbox = []
         self._response = None
         self._sending = False
+        self.parameter = None
+        self.resets = 0
 
     def send_command(self, cmd, delay=0.2):
         full_cmd = f"{cmd}\r\n"
@@ -53,6 +55,11 @@ class RYLR896:
                 self._response = text
                 if text.startswith("+ERR"):
                     print(f"Module: {text}")
+            elif text.startswith("+PARAMETER="):
+                self.parameter = text[len("+PARAMETER="):]
+            elif text.startswith("+READY") or text.startswith("+RESET"):
+                self.resets += 1
+                print(f"Module: {text}")
             elif text:
                 print(f"Module: {text}")
             return True
@@ -153,6 +160,36 @@ class RYLR896:
                 print("Module: timed out waiting for +OK")
                 return False
             return self._response.startswith("+OK")
+        finally:
+            self._sending = False
+
+    def _await(self, done, timeout):
+        deadline = time.monotonic() + timeout
+        while not done() and time.monotonic() < deadline:
+            self.poll()
+            time.sleep(0.005)
+        return done()
+
+    def command(self, cmd, timeout=1.0):
+        self._sending = True
+        try:
+            self.poll()
+            self._response = None
+            self.ser.write(f"{cmd}\r\n".encode())
+            if not self._await(lambda: self._response is not None, timeout):
+                return False
+            return self._response.startswith("+OK")
+        finally:
+            self._sending = False
+
+    def query_parameter(self, timeout=1.0):
+        self._sending = True
+        try:
+            self.poll()
+            self.parameter = None
+            self.ser.write(b"AT+PARAMETER?\r\n")
+            self._await(lambda: self.parameter is not None, timeout)
+            return self.parameter
         finally:
             self._sending = False
 

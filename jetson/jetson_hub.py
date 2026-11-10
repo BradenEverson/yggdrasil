@@ -13,6 +13,8 @@ RADIO_BROADCAST_ADDR = 0
 ROOT_ANNOUNCE_PERIOD_S = 15 * 60.0
 ROOT_ANNOUNCE_JITTER_S = 30.0
 LOOP_SLEEP_S = 0.005
+RADIO_CHECK_PERIOD_S = 60.0
+ROOT_BEACON_MS = 20_000
 
 BANDWIDTH_CODES = {
     7800: 0,
@@ -85,9 +87,12 @@ def describe_frame(frame):
 
 
 class Hub(object):
-    def __init__(self, radio, log, address, sf, bandwidth_hz, coding_rate, preamble, trace=False):
+    def __init__(self, radio, log, address, sf, bandwidth_hz, coding_rate, preamble, tx_power, trace=False):
         self.trace = trace
         self.radio = radio
+        self.parameter = f"{sf},{BANDWIDTH_CODES[bandwidth_hz]},{coding_rate},{preamble}"
+        self.tx_power = tx_power
+        self.seen_resets = radio.resets
         self.log = log
         self.last_rssi = None
         self.last_snr = None
@@ -100,6 +105,20 @@ class Hub(object):
         )
         self.node.configure_power(0, sf, bandwidth_hz, coding_rate, preamble)
         self.node.set_root_seq(int(time.time() // 60))
+        self.node.set_root_beacon(ROOT_BEACON_MS)
+
+    def check_radio(self):
+        resets = self.radio.resets
+        current = self.radio.query_parameter()
+        if current == self.parameter and resets == self.seen_resets:
+            return
+
+        print(f"Radio drifted (parameter={current}, resets={resets - self.seen_resets}), restoring {self.parameter}")
+        self.seen_resets = resets
+        if not self.radio.command(f"AT+PARAMETER={self.parameter}"):
+            print("Failed to restore AT+PARAMETER")
+        if not self.radio.command(f"AT+CRFOP={self.tx_power}"):
+            print("Failed to restore AT+CRFOP")
 
     def transmit(self, frame):
         ok = self.radio.send_data(RADIO_BROADCAST_ADDR, frame)
@@ -160,6 +179,7 @@ class Hub(object):
         self.node.announce_root()
 
         next_announce = time.monotonic() + self.announce_delay()
+        next_radio_check = time.monotonic()
         known_neighbors = []
 
         print("Hub running...")
@@ -168,6 +188,10 @@ class Hub(object):
             self.radio.poll()
 
             now = time.monotonic()
+            if now >= next_radio_check or self.radio.resets != self.seen_resets:
+                self.check_radio()
+                next_radio_check = time.monotonic() + RADIO_CHECK_PERIOD_S
+
             if now >= next_announce:
                 self.node.announce_root()
                 next_announce = now + self.announce_delay()
@@ -214,7 +238,7 @@ def main():
         radio.send_command("AT+NETWORKID?")
         radio.send_command("AT+PARAMETER?")
 
-        hub = Hub(radio, log, args.address, args.sf, args.bw, args.cr, args.preamble, trace=args.trace)
+        hub = Hub(radio, log, args.address, args.sf, args.bw, args.cr, args.preamble, args.power, trace=args.trace)
         radio.on_receive = hub.on_radio
         hub.run()
 

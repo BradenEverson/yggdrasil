@@ -90,6 +90,11 @@ export fn ygg_configure_power(period_ms: u32, spreading_factor: u8, bandwidth_hz
     node.max_retries = 10;
 }
 
+export fn ygg_set_root_beacon(period_ms: u32) void {
+    if (!initialized) return;
+    if (node.power) |*p| p.root_beacon_ms = period_ms;
+}
+
 export fn ygg_set_root_seq(seq: u16) void {
     if (initialized) node.root_seq = seq;
 }
