@@ -148,7 +148,7 @@ fn quiesce() void {
 }
 
 fn sleepRadio() void {
-    if (!radio_awake) return;
+    if (!node_config.radio_sleep or !radio_awake) return;
     lora.sleep() catch |e| {
         log("radio sleep failed: {s}\r\n", .{@errorName(e)});
         return;
@@ -298,6 +298,11 @@ fn app() void {
 
         const idle = ygg.idleFor();
         if (idle == 0) continue;
+
+        if (!node_config.radio_sleep) {
+            hal.lowpower.idle();
+            continue;
+        }
 
         const until_sample = next_sample -% hal.timer.millis();
         const nap = @min(idle, until_sample);
