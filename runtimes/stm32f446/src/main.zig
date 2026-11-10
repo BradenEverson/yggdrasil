@@ -69,7 +69,15 @@ fn radioRead(buf: []u8) yggdrasil.YggdrasilError![]u8 {
     return lora.read(buf);
 }
 
+fn traceFrame(dir: []const u8, f: []const u8) void {
+    if (!node_config.trace or f.len < yggdrasil.NetworkPacket.HEADER_LEN) return;
+    const from = (@as(u16, f[1]) << 8) | f[2];
+    const to = (@as(u16, f[3]) << 8) | f[4];
+    log("{s} {}>{} len={} f={x} t={}\r\n", .{ dir, from, to, f[11], f[10], hal.timer.millis() });
+}
+
 fn radioWrite(buf: []u8) yggdrasil.YggdrasilError!void {
+    traceFrame("tx", buf);
     lora.sendData(RADIO_BROADCAST_ADDR, buf) catch |e| {
         log("send failed: {s}\r\n", .{@errorName(e)});
         return error.WriteFailed;
@@ -149,6 +157,7 @@ fn sleepRadio() void {
 }
 
 var wake_reported = false;
+var seen_frames: u32 = 0;
 
 fn wakeRadio() void {
     if (radio_awake) return;
@@ -160,9 +169,10 @@ fn wakeRadio() void {
         configureRadio() catch |err| fail("radio config", err);
     };
     radio_awake = true;
-    if (!wake_reported) {
+    const took = hal.timer.millis() -% start;
+    if (!wake_reported or took > POWER.radio_wake_ms) {
         wake_reported = true;
-        log("radio wake took {} ms\r\n", .{hal.timer.millis() -% start});
+        log("radio wake took {} ms\r\n", .{took});
     }
 }
 
@@ -259,6 +269,10 @@ fn app() void {
             wakeRadio();
 
             ygg.readStream() catch |e| log("read failed: {s}\r\n", .{@errorName(e)});
+            if (lora.received != seen_frames) {
+                seen_frames = lora.received;
+                traceFrame("rx", lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)]);
+            }
 
             var writes: usize = 0;
             while (writes < MAX_WRITES_PER_PASS) : (writes += 1) {

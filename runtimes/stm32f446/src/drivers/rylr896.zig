@@ -16,6 +16,11 @@ inbox_head: u32 = 0,
 inbox_tail: u32 = 0,
 inbox_dropped: u32 = 0,
 
+received: u32 = 0,
+last_rx: [FRAME_PEEK]u8 = undefined,
+last_rx_len: usize = 0,
+rx_index: usize = 0,
+
 const Self = @This();
 
 pub const RylrError = error{
@@ -78,8 +83,9 @@ pub const Parameters = struct {
     preamble: u8 = 4,
 };
 
-const WAKE_TIMEOUT_MS: u32 = 300;
-const WAKE_ATTEMPTS: u32 = 3;
+const WAKE_TIMEOUT_MS: u32 = 600;
+const WAKE_ATTEMPTS: u32 = 4;
+pub const FRAME_PEEK: usize = 18;
 
 pub fn reset(self: *Self) void {
     self.line_state = .text;
@@ -119,6 +125,9 @@ fn pushInbox(self: *Self, byte: u8) void {
 fn feed(self: *Self, byte: u8) ?Response {
     switch (self.line_state) {
         .text => {
+            if (self.line_len == 0 and byte != '+')
+                return null;
+
             if (self.line_len < self.rx_buffer.len) {
                 self.rx_buffer[self.line_len] = byte;
                 self.line_len += 1;
@@ -145,6 +154,8 @@ fn feed(self: *Self, byte: u8) ?Response {
         .rcv_len => {
             if (byte == ',') {
                 self.line_state = if (self.rcv_remaining == 0) .rcv_trailer else .rcv_data;
+                self.last_rx_len = self.rcv_remaining;
+                self.rx_index = 0;
             } else if (byte >= '0' and byte <= '9' and self.rcv_remaining < 1000) {
                 self.rcv_remaining = self.rcv_remaining * 10 + (byte - '0');
             } else {
@@ -152,10 +163,14 @@ fn feed(self: *Self, byte: u8) ?Response {
             }
         },
         .rcv_data => {
+            if (self.rx_index < FRAME_PEEK) self.last_rx[self.rx_index] = byte;
+            self.rx_index += 1;
             self.pushInbox(byte);
             self.rcv_remaining -= 1;
-            if (self.rcv_remaining == 0)
+            if (self.rcv_remaining == 0) {
                 self.line_state = .rcv_trailer;
+                self.received +%= 1;
+            }
         },
         .rcv_trailer => {
             if (byte == '\n')
@@ -193,9 +208,13 @@ fn classify(line: []const u8) Response {
 }
 
 fn send(self: *Self, msg: []const u8) RylrError!void {
+    return self.command(msg, self.timeout_ms);
+}
+
+fn command(self: *Self, msg: []const u8, timeout_ms: u32) RylrError!void {
     self.poll();
     hal.uart.writeStr(self.uart, msg);
-    return self.awaitReply(self.timeout_ms, false);
+    return self.awaitReply(timeout_ms, false);
 }
 
 fn awaitReply(self: *Self, timeout_ms: u32, accept_ready: bool) RylrError!void {
@@ -224,10 +243,11 @@ pub fn wake(self: *Self) RylrError!void {
 
     var attempt: u32 = 0;
     while (attempt < WAKE_ATTEMPTS) : (attempt += 1) {
-        hal.uart.writeStr(self.uart, "AT\r\n");
-        self.awaitReply(WAKE_TIMEOUT_MS, true) catch continue;
         self.line_len = 0;
-        self.send("AT\r\n") catch continue;
+        hal.uart.writeStr(self.uart, "AT\r\n");
+        self.awaitReply(WAKE_TIMEOUT_MS, true) catch {};
+        self.line_len = 0;
+        self.command("AT+MODE=0\r\n", WAKE_TIMEOUT_MS) catch continue;
         return;
     }
 

@@ -69,8 +69,24 @@ class CsvLog(object):
         self.file.close()
 
 
+def describe_frame(frame):
+    if len(frame) < 18 or frame[0] != 0x72:
+        return f"(not a frame, {len(frame)} bytes)"
+    src = (frame[1] << 8) | frame[2]
+    dst = (frame[3] << 8) | frame[4]
+    flags = frame[10]
+    length = frame[11]
+    wake = (frame[12] << 16) | (frame[13] << 8) | frame[14]
+    period = ((frame[15] << 8) | frame[16]) * 100
+    hops = frame[17]
+    names = [n for i, n in enumerate(["ack", "bcast", "nack", "sn", "nesn"]) if flags & (1 << (7 - i))]
+    op = frame[18] if length else None
+    return f"{src}>{dst} len={length} op={op} hops={hops} period={period} wake={wake} [{','.join(names)}]"
+
+
 class Hub(object):
-    def __init__(self, radio, log, address, sf, bandwidth_hz, coding_rate, preamble):
+    def __init__(self, radio, log, address, sf, bandwidth_hz, coding_rate, preamble, trace=False):
+        self.trace = trace
         self.radio = radio
         self.log = log
         self.last_rssi = None
@@ -86,11 +102,17 @@ class Hub(object):
         self.node.set_root_seq(int(time.time() // 60))
 
     def transmit(self, frame):
-        return self.radio.send_data(RADIO_BROADCAST_ADDR, frame)
+        ok = self.radio.send_data(RADIO_BROADCAST_ADDR, frame)
+        if self.trace:
+            print(f"{time.monotonic():.3f} tx {describe_frame(frame)} ok={ok}")
+        return ok
 
     def on_radio(self, message):
         self.last_rssi = message["rssi"]
         self.last_snr = message["snr"]
+        if self.trace:
+            print(f"{time.monotonic():.3f} rx {describe_frame(message['data'])} rssi={message['rssi']} snr={message['snr']}")
+        self.node.tick()
         self.node.feed(message["data"])
 
     def on_packet(self, origin, from_addr, dest, broadcast, body):
@@ -172,6 +194,7 @@ def main():
     parser.add_argument("--cr", type=int, default=1, choices=[1, 2, 3, 4], help="LoRa coding rate (1 = 4/5)")
     parser.add_argument("--preamble", type=int, default=4, choices=[4, 5, 6, 7], help="LoRa programmed preamble")
     parser.add_argument("--power", type=int, default=15, choices=range(16), help="RF output power in dBm")
+    parser.add_argument("--trace", action="store_true", help="Print every frame sent and received")
     args = parser.parse_args()
 
     print("Jetson Nano Hub!")
@@ -191,7 +214,7 @@ def main():
         radio.send_command("AT+NETWORKID?")
         radio.send_command("AT+PARAMETER?")
 
-        hub = Hub(radio, log, args.address, args.sf, args.bw, args.cr, args.preamble)
+        hub = Hub(radio, log, args.address, args.sf, args.bw, args.cr, args.preamble, trace=args.trace)
         radio.on_receive = hub.on_radio
         hub.run()
 
