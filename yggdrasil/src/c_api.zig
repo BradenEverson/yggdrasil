@@ -74,6 +74,31 @@ export fn ygg_init(
     initialized = true;
 }
 
+export fn ygg_configure_power(period_ms: u32, spreading_factor: u8, bandwidth_hz: u32, coding_rate: u8, preamble: u8) void {
+    if (!initialized) return;
+    node.power = .{
+        .period_ms = period_ms,
+        .radio = .{
+            .spreading_factor = @intCast(std.math.clamp(spreading_factor, 7, 12)),
+            .bandwidth_hz = bandwidth_hz,
+            .coding_rate = @intCast(std.math.clamp(coding_rate, 1, 4)),
+            .preamble = preamble,
+        },
+    };
+    node.topology_flooding = false;
+    node.topology_reporting = true;
+    node.max_retries = 10;
+}
+
+export fn ygg_set_root_seq(seq: u16) void {
+    if (initialized) node.root_seq = seq;
+}
+
+export fn ygg_idle_for() u32 {
+    if (!initialized) return 0;
+    return node.idleFor();
+}
+
 export fn ygg_set_time(ms: u32) void {
     now_ms = ms;
 }

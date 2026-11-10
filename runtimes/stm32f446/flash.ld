@@ -21,6 +21,7 @@ PROVIDE(DebugMon_Handler   = Default_Handler);
 PROVIDE(PendSV_Handler     = Default_Handler);
 PROVIDE(SysTick_Handler    = Default_Handler);
 PROVIDE(USART1_IRQHandler  = Default_Handler);
+PROVIDE(RTC_WKUP_IRQHandler = Default_Handler);
 
 SECTIONS {
     .vectors :
@@ -41,7 +42,7 @@ SECTIONS {
         LONG(Default_Handler + 1)
         LONG(Default_Handler + 1)
         LONG(Default_Handler + 1)
-        LONG(Default_Handler + 1)
+        LONG(RTC_WKUP_IRQHandler + 1)
         LONG(Default_Handler + 1)
         LONG(Default_Handler + 1)
         LONG(Default_Handler + 1)

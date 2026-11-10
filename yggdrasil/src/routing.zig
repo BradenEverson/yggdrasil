@@ -185,6 +185,16 @@ pub const MessageQueueMap = struct {
     sent: bool = false,
     retries: u8 = 0,
     retransmit_at: u32 = 0,
+
+    heard_at: u32 = 0,
+    sched_known: bool = false,
+    period_ms: u32 = 0,
+    next_window: u32 = 0,
+    synced_at: u32 = 0,
+    hops: u8 = 0xFF,
+    tx_at: ?u32 = null,
+    announce_pending: bool = false,
+    hello_pending: bool = false,
 };
 
 pub const ForwardingTable = struct {

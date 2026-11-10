@@ -48,6 +48,12 @@ def _load(path):
     lib = ctypes.CDLL(path)
     lib.ygg_init.argtypes = [ctypes.c_uint16, ctypes.c_bool, _WRITE_CB, _PACKET_CB, _LOST_CB]
     lib.ygg_init.restype = None
+    lib.ygg_configure_power.argtypes = [ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint8]
+    lib.ygg_configure_power.restype = None
+    lib.ygg_set_root_seq.argtypes = [ctypes.c_uint16]
+    lib.ygg_set_root_seq.restype = None
+    lib.ygg_idle_for.argtypes = []
+    lib.ygg_idle_for.restype = ctypes.c_uint32
     lib.ygg_set_time.argtypes = [ctypes.c_uint32]
     lib.ygg_set_time.restype = None
     lib.ygg_feed.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
@@ -112,6 +118,15 @@ class Node(object):
     def tick(self):
         ms = int((time.monotonic() - self._t0) * 1000) & 0xFFFFFFFF
         self._lib.ygg_set_time(ms)
+
+    def configure_power(self, period_ms, spreading_factor, bandwidth_hz, coding_rate, preamble):
+        self._lib.ygg_configure_power(period_ms, spreading_factor, bandwidth_hz, coding_rate, preamble)
+
+    def set_root_seq(self, seq):
+        self._lib.ygg_set_root_seq(seq & 0xFFFF)
+
+    def idle_for(self):
+        return self._lib.ygg_idle_for()
 
     def feed(self, data):
         self._lib.ygg_feed(data, len(data))

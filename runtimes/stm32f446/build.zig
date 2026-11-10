@@ -34,6 +34,15 @@ pub fn build(b: *std.Build) void {
 
     const node_config = b.addOptions();
     node_config.addOption(u16, "node_addr", b.option(u16, "node_addr", "Yggdrasil address of this node") orelse 1);
+    node_config.addOption(u32, "period_ms", b.option(u32, "period_ms", "Listen and sample period in ms, multiple of 100") orelse 60_000);
+    node_config.addOption(u4, "sf", b.option(u4, "sf", "LoRa spreading factor 7-12, must match the whole network") orelse 9);
+    node_config.addOption(u32, "bw", b.option(u32, "bw", "LoRa bandwidth in Hz, must match the whole network") orelse 125_000);
+    node_config.addOption(u3, "cr", b.option(u3, "cr", "LoRa coding rate 1-4, must match the whole network") orelse 1);
+    node_config.addOption(u8, "preamble", b.option(u8, "preamble", "LoRa programmed preamble 4-7") orelse 4);
+    node_config.addOption(u4, "tx_power", b.option(u4, "tx_power", "RF output power in dBm 0-15") orelse 15);
+    node_config.addOption(u32, "radio_wake_ms", b.option(u32, "radio_wake_ms", "Lead time to wake the radio before a window") orelse 100);
+    node_config.addOption(bool, "log", b.option(bool, "log", "Print debug output on USART2") orelse true);
+    node_config.addOption(bool, "swd", b.option(bool, "swd", "Keep the SWD pins active") orelse true);
     obj.root_module.addOptions("node_config", node_config);
 
     const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "--gc-sections", "-T", "flash.ld", "-o" });

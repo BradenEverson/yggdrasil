@@ -5,7 +5,8 @@ pub const CRC = @import("network_packet/crc.zig");
 
 pub const HEADER: u8 = 0x72;
 pub const BROADCAST_ADDR: u16 = 0xFFFF;
-pub const HEADER_LEN: usize = 12;
+pub const HEADER_LEN: usize = 18;
+pub const NO_HOPS: u8 = 0xFF;
 
 const ACK_BIT: u8 = 7;
 const BROADCAST_BIT: u8 = 6;
@@ -14,7 +15,7 @@ const SN_BIT: u8 = 4;
 const NESN_BIT: u8 = 3;
 
 /// LoRA max - header - from - to - origin - dest - ttl - flags - len - crc
-pub const MAX_PAYLOAD_SIZE: usize = 240 - 1 - 2 - 2 - 2 - 2 - 1 - 1 - 1 - 2;
+pub const MAX_PAYLOAD_SIZE: usize = 240 - HEADER_LEN - 2;
 
 from: u16 = 0,
 to: u16 = 0,
@@ -27,6 +28,9 @@ nack: bool = false,
 sn: bool = false,
 nesn: bool = false,
 len: u8 = 0,
+wake_in: u24 = 0,
+period: u16 = 0,
+hops: u8 = NO_HOPS,
 payload: [MAX_PAYLOAD_SIZE]u8 = undefined,
 crc: ?u16 = null,
 
@@ -78,6 +82,15 @@ pub fn toBuffer(self: *Packet, buf: []u8) []u8 {
 
     buf[11] = self.len;
 
+    buf[12] = @truncate(self.wake_in >> 16);
+    buf[13] = @truncate(self.wake_in >> 8);
+    buf[14] = @truncate(self.wake_in >> 0);
+
+    buf[15] = @truncate(self.period >> 8);
+    buf[16] = @truncate(self.period >> 0);
+
+    buf[17] = self.hops;
+
     @memcpy(buf[HEADER_LEN .. HEADER_LEN + self.len], self.payload[0..self.len]);
 
     if (self.crc == null)
@@ -118,6 +131,9 @@ test "to buffer" {
         .nesn = true,
 
         .len = 2,
+        .wake_in = 0x01_02_03,
+        .period = 0x0405,
+        .hops = 6,
     };
     p.payload[0] = 0xBE;
     p.payload[1] = 0xAD;
@@ -145,14 +161,23 @@ test "to buffer" {
 
         0x02,
 
+        0x01,
+        0x02,
+        0x03,
+
+        0x04,
+        0x05,
+
+        0x06,
+
         0xBE,
         0xAD,
 
         // We keep crc as null, so this enforces that
         // writing to buffer with a null crc first
         // calculates the crc
-        0xE3,
-        0x28,
+        0xD2,
+        0xA0,
     };
 
     try std.testing.expectEqualSlices(u8, &expected, packet_buf);
