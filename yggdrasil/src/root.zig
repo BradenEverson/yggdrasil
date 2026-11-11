@@ -8,6 +8,9 @@ pub const MessageQueue = @import("message_queue.zig");
 
 pub const routing = @import("routing.zig");
 pub const link_layer = @import("link_layer.zig");
+pub const lora = @import("lora.zig");
+pub const power = @import("power.zig");
+pub const Power = power.Power;
 pub const ForwardingTable = routing.ForwardingTable;
 
 /// Errors that are common to most APIs and
@@ -56,6 +59,15 @@ pub const ParseState = enum {
     awaiting_flags,
 
     awaiting_len,
+
+    awaiting_wake_hi,
+    awaiting_wake_mid,
+    awaiting_wake_lo,
+
+    awaiting_period_msb,
+    awaiting_period_lsb,
+
+    awaiting_hops,
 
     reading_payload,
 
@@ -111,6 +123,26 @@ pub const Yggdrasil = struct {
     own_flood_pending: bool = false,
     own_flood_at: u32 = 0,
 
+    power: ?Power = null,
+    topology_reporting: bool = false,
+    own_window: u32 = 0,
+    own_window_set: bool = false,
+    old_window: u32 = 0,
+    old_window_until: ?u32 = null,
+    awake_until: u32 = 0,
+    joining_until: ?u32 = null,
+    next_join_at: ?u32 = null,
+    hellos_left: u8 = 0,
+    next_hello_at: u32 = 0,
+    ever_rooted: bool = false,
+    next_beacon_at: ?u32 = null,
+    join_backoff_ms: u32 = 0,
+    lost_root: ?RootRoute = null,
+    lost_root_at: u32 = 0,
+    report_at: ?u32 = null,
+    reported_at: u32 = 0,
+    reported_once: bool = false,
+
     /// scheduling mechanism to wrap around all neighbors' message queues
     pub fn requestWrite(ygg: *Yggdrasil) YggdrasilError!bool {
         const mq = &ygg.outgoing_packets;
@@ -121,11 +153,25 @@ pub const Yggdrasil = struct {
         ygg.expireRoot(now);
         ygg.expireTopology(now);
 
+        if (ygg.power != null) {
+            ygg.expireNeighbors(now);
+            if (try ygg.maintainJoin(now))
+                return true;
+            ygg.maintainBeacon(now);
+            ygg.refill();
+            ygg.maintainReport(now);
+        }
+
         for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
             if (!neighbor.ack_pending)
                 continue;
 
-            if (mq.txBuffer(neighbor.mq_idx) != null and ygg.retransmitDue(neighbor, now))
+            if (mq.txBuffer(neighbor.mq_idx)) |pending| {
+                if (ygg.sendable(neighbor, now, frameLen(pending)))
+                    continue;
+            }
+
+            if (!ygg.reachable(neighbor, now, power.ACK_FRAME))
                 continue;
 
             var ack = NetworkPacket{
@@ -170,7 +216,8 @@ pub const Yggdrasil = struct {
             if (n.sent)
                 n.retries +|= 1;
             n.sent = true;
-            n.retransmit_at = now +% ygg.retransmit_timeout_ms +% ygg.random(ygg.retransmit_jitter_ms);
+            n.tx_at = null;
+            n.retransmit_at = now +% ygg.retransmitDelay(frameLen(packet));
         }
 
         try ygg.writePacket(packet);
@@ -187,9 +234,544 @@ pub const Yggdrasil = struct {
 
         fn ready(sched: Schedule, slot: usize) bool {
             const neighbor = sched.ygg.forwarding_table.neighborBySlot(slot) orelse return true;
-            return sched.ygg.retransmitDue(neighbor, sched.now);
+            const packet = sched.ygg.outgoing_packets.tx_buffers[slot] orelse return false;
+            return sched.ygg.sendable(neighbor, sched.now, frameLen(&packet));
         }
     };
+
+    fn frameLen(packet: *const NetworkPacket) usize {
+        return NetworkPacket.HEADER_LEN + packet.len + 2;
+    }
+
+    fn retransmitDelay(ygg: *Yggdrasil, len: usize) u32 {
+        if (ygg.power) |p|
+            return p.lingerMs(len) +% ygg.random(p.backoffMs());
+        return ygg.retransmit_timeout_ms +% ygg.random(ygg.retransmit_jitter_ms);
+    }
+
+    fn sendable(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, now: u32, len: usize) bool {
+        if (!ygg.retransmitDue(neighbor, now))
+            return false;
+        if (ygg.power == null)
+            return true;
+        return reached(now, ygg.plannedTx(neighbor, now, len)) and ygg.reachable(neighbor, now, len);
+    }
+
+    fn alwaysListening(neighbor: *const routing.MessageQueueMap) bool {
+        return !neighbor.sched_known or neighbor.period_ms == 0;
+    }
+
+    fn lingering(ygg: *const Yggdrasil, neighbor: *const routing.MessageQueueMap, now: u32, len: usize) bool {
+        const p = ygg.power orelse return true;
+        if (!neighbor.sched_known)
+            return false;
+        return (now +% p.frameMs(len)) -% neighbor.heard_at < p.lingerMs(power.ACK_FRAME);
+    }
+
+    fn guardFor(ygg: *const Yggdrasil, neighbor: *const routing.MessageQueueMap, now: u32, len: usize) u32 {
+        const p = ygg.power.?;
+        const window = p.windowMs();
+        const cap = (window -| p.frameMs(len)) / 2;
+        return @min(p.guardMs(now -% neighbor.synced_at), cap);
+    }
+
+    fn reachable(ygg: *const Yggdrasil, neighbor: *const routing.MessageQueueMap, now: u32, len: usize) bool {
+        const p = ygg.power orelse return true;
+        if (alwaysListening(neighbor) or ygg.lingering(neighbor, now, len))
+            return true;
+
+        const start = power.windowAt(neighbor.next_window, neighbor.period_ms, now);
+        const into = now -% start;
+        const g = ygg.guardFor(neighbor, now, len);
+        const frame = p.frameMs(len);
+        if (frame + 2 * g > p.windowMs())
+            return into >= g and into <= g + p.backoffMs();
+        return into >= g and into + frame + g <= p.windowMs();
+    }
+
+    fn plannedTx(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, from: u32, len: usize) u32 {
+        const p = ygg.power orelse return from;
+
+        if (alwaysListening(neighbor) or ygg.lingering(neighbor, from, len)) {
+            if (neighbor.tx_at) |t| {
+                if (after(t, from) and !after(t, from +% 2 * p.backoffMs()))
+                    return t;
+            }
+            return from;
+        }
+
+        var start = power.windowAt(neighbor.next_window, neighbor.period_ms, from);
+        const g = ygg.guardFor(neighbor, from, len);
+        const usable = @max(p.windowMs() -| (g + p.frameMs(len)), g);
+        if (from -% start > usable)
+            start +%= neighbor.period_ms;
+
+        const earliest = if (after(start +% g, from)) start +% g else from;
+        const latest = start +% usable;
+
+        if (neighbor.tx_at) |t| {
+            if (reached(t, earliest) and reached(latest, t))
+                return t;
+        }
+
+        const span = if (after(latest, earliest)) @min(p.backoffMs(), latest -% earliest) else 0;
+        const t = earliest +% ygg.random(span);
+        neighbor.tx_at = t;
+        return t;
+    }
+
+    fn after(a: u32, b: u32) bool {
+        return power.after(a, b);
+    }
+
+    fn stayAwake(ygg: *Yggdrasil, until: u32) void {
+        if (after(until, ygg.awake_until))
+            ygg.awake_until = until;
+    }
+
+    fn ownHops(ygg: *const Yggdrasil) u8 {
+        if (ygg.is_root)
+            return 0;
+        const current = ygg.root orelse return NetworkPacket.NO_HOPS;
+        return current.hops;
+    }
+
+    fn ownWindowStart(ygg: *Yggdrasil, now: u32) u32 {
+        const p = ygg.power.?;
+        const period = p.periodMs();
+        if (!ygg.own_window_set) {
+            ygg.own_window = now +% ygg.random(period);
+            ygg.own_window_set = true;
+        }
+        return power.windowAt(ygg.own_window, period, now);
+    }
+
+    fn ownWindowOpen(ygg: *Yggdrasil, now: u32) bool {
+        const p = ygg.power orelse return true;
+        if (!p.sleepy())
+            return true;
+
+        const window = p.windowMs();
+        if (now -% ygg.ownWindowStart(now) < window)
+            return true;
+
+        const until = ygg.old_window_until orelse return false;
+        if (reached(now, until)) {
+            ygg.old_window_until = null;
+            return false;
+        }
+        return now -% power.windowAt(ygg.old_window, p.periodMs(), now) < window;
+    }
+
+    fn stamp(ygg: *Yggdrasil, packet: *NetworkPacket) void {
+        packet.hops = ygg.ownHops();
+        packet.wake_in = 0;
+        packet.period = 0;
+
+        const p = ygg.power orelse return;
+        if (!p.sleepy() or ygg.joining_until != null)
+            return;
+
+        const now = ygg.currentTime();
+        const next = ygg.ownWindowStart(now) +% p.periodMs();
+        packet.wake_in = @intCast(@min(next -% now, power.MAX_WAKE_IN));
+        packet.period = p.advertisedPeriod();
+    }
+
+    fn trafficLen(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, now: u32) ?usize {
+        const p = ygg.power.?;
+        if (ygg.outgoing_packets.txBuffer(neighbor.mq_idx)) |packet|
+            return frameLen(packet);
+        if (neighbor.hello_pending or neighbor.announce_pending)
+            return p.frame_budget;
+        if (neighbor.ack_pending and ygg.lingering(neighbor, now, power.ACK_FRAME))
+            return power.ACK_FRAME;
+        return null;
+    }
+
+    const Wake = struct {
+        now: u32,
+        at: u32,
+
+        fn consider(wake: *Wake, t: u32) void {
+            if (!after(t, wake.now)) {
+                wake.at = wake.now;
+            } else if (after(wake.at, t)) {
+                wake.at = t;
+            }
+        }
+    };
+
+    pub fn idleFor(ygg: *Yggdrasil) u32 {
+        const p = ygg.power orelse return 0;
+        if (!p.sleepy())
+            return 0;
+
+        const now = ygg.currentTime();
+        if (ygg.joining_until != null or after(ygg.awake_until, now))
+            return 0;
+        ygg.awake_until = now;
+
+        if (ygg.ownWindowOpen(now))
+            return 0;
+
+        const period = p.periodMs();
+        var wake = Wake{ .now = now, .at = now +% p.max_idle_ms };
+        wake.consider(ygg.ownWindowStart(now) +% period);
+        if (ygg.old_window_until != null)
+            wake.consider(power.windowAt(ygg.old_window, period, now) +% period);
+
+        const ft = &ygg.forwarding_table;
+        for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
+            const len = ygg.trafficLen(neighbor, now) orelse continue;
+            const from = if (neighbor.sent and after(neighbor.retransmit_at, now)) neighbor.retransmit_at else now;
+            wake.consider(ygg.plannedTx(neighbor, from, len));
+        }
+
+        if (!ygg.is_root and ygg.root == null) {
+            if (ygg.next_join_at) |t| wake.consider(t) else wake.consider(now);
+        }
+
+        if (ygg.root) |current| {
+            if (ygg.root_timeout_ms != 0)
+                wake.consider(current.heard_at +% ygg.root_timeout_ms);
+            if (ygg.topology_reporting and !ygg.is_root)
+                wake.consider(ygg.reportDueAt(p));
+        }
+
+        if (ygg.pending_announce != null)
+            wake.consider(ygg.announce_at);
+
+        if (ygg.topology_flooding and ygg.own_flood_pending)
+            wake.consider(ygg.own_flood_at);
+
+        const left = wake.at -% now;
+        return if (left <= p.radio_wake_ms) 0 else left - p.radio_wake_ms;
+    }
+
+    fn noteFrame(ygg: *Yggdrasil, packet: *const NetworkPacket, now: u32) void {
+        const p = ygg.power orelse return;
+        if (packet.from == ygg.address)
+            return;
+
+        const to_us = packet.broadcast or packet.to == ygg.address;
+        if (to_us)
+            ygg.stayAwake(now +% p.lingerMs(p.frame_budget));
+
+        const learn = ygg.joining_until != null or (!packet.broadcast and packet.to == ygg.address) or isHello(packet);
+        const neighbor = ygg.forwarding_table.neighborByAddr(packet.from) orelse
+            (if (learn) ygg.learnNeighbor(packet.from) catch return else return);
+
+        neighbor.heard_at = now;
+        neighbor.hops = packet.hops;
+        neighbor.sched_known = true;
+        neighbor.period_ms = @as(u32, packet.period) * power.PERIOD_UNIT_MS;
+        if (neighbor.period_ms != 0) {
+            neighbor.next_window = now -% p.frameMs(frameLen(packet)) +% packet.wake_in;
+            neighbor.synced_at = now;
+        }
+
+        if (ygg.root) |current| {
+            if (!ygg.is_root and current.via == packet.from)
+                ygg.followParent(neighbor, packet.hops, now);
+        }
+    }
+
+    fn isHello(packet: *const NetworkPacket) bool {
+        const app = AppPacket.parse(packet.body()) orelse return false;
+        return app.op == .hello and !packet.ack;
+    }
+
+    fn followParent(ygg: *Yggdrasil, parent: *routing.MessageQueueMap, hops: u8, now: u32) void {
+        const p = ygg.power.?;
+        if (hops == NetworkPacket.NO_HOPS or hops +| 1 > p.max_hops) {
+            ygg.loseRoot(now);
+            return;
+        }
+
+        const current = &ygg.root.?;
+        current.heard_at = now;
+        if (current.hops != hops + 1) {
+            current.hops = hops + 1;
+            ygg.forwarding_table.setRoute(current.addr, parent.mq_idx, current.hops) catch {};
+        }
+
+        ygg.alignWindow(now);
+    }
+
+    fn alignWindow(ygg: *Yggdrasil, now: u32) void {
+        const p = ygg.power orelse return;
+        if (!p.sleepy() or ygg.is_root)
+            return;
+
+        const current = ygg.root orelse return;
+        const parent = ygg.forwarding_table.neighborByAddr(current.via) orelse return;
+        if (alwaysListening(parent))
+            return;
+
+        const period = p.periodMs();
+        const lead = p.windowMs() + p.radio_wake_ms + p.guard_ms;
+        const target = parent.next_window -% lead;
+
+        const ours = ygg.ownWindowStart(now);
+        const offset = ours -% power.windowAt(target, period, ours);
+        const tolerance = @max(p.windowMs() / 4, 4 * p.guard_ms);
+        if (offset <= tolerance or period - offset <= tolerance)
+            return;
+
+        ygg.old_window = ours;
+        ygg.old_window_until = now +% @as(u32, p.legacy_periods) * period;
+        ygg.own_window = target;
+    }
+
+    fn loseRoot(ygg: *Yggdrasil, now: u32) void {
+        const current = ygg.root orelse return;
+        ygg.lost_root = current;
+        ygg.lost_root_at = now;
+        ygg.forwarding_table.removeRoute(current.addr);
+        ygg.root = null;
+        ygg.next_join_at = now +% ygg.joinJitter();
+        ygg.join_backoff_ms = 0;
+        ygg.recomputeRoutes();
+    }
+
+    fn feasible(ygg: *const Yggdrasil, ann: AppPacket.RootAnnouncement, now: u32) bool {
+        const p = ygg.power orelse return true;
+        const lost = ygg.lost_root orelse return true;
+        if (lost.addr != ann.root or routing.seqNewer(ann.seq, lost.seq))
+            return true;
+        if (ann.seq != lost.seq)
+            return false;
+        if (ann.hops < lost.hops)
+            return true;
+        return reached(now, ygg.lost_root_at +% p.rootHolddownMs());
+    }
+
+    fn currentAnnouncement(ygg: *const Yggdrasil) ?AppPacket.RootAnnouncement {
+        if (ygg.is_root)
+            return .{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 };
+        const current = ygg.root orelse return null;
+        return .{ .root = current.addr, .seq = current.seq, .hops = current.hops };
+    }
+
+    fn markAnnounce(ygg: *Yggdrasil, except: ?u16, hops: u8) void {
+        const ft = &ygg.forwarding_table;
+        for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
+            if (except != null and neighbor.addr == except.?)
+                continue;
+            if (neighbor.hops == NetworkPacket.NO_HOPS or neighbor.hops >= hops)
+                neighbor.announce_pending = true;
+        }
+    }
+
+    fn directPacket(ygg: *const Yggdrasil, to: u16, op: AppPacket.Opcode) NetworkPacket {
+        var packet = NetworkPacket{
+            .from = ygg.address,
+            .to = to,
+            .origin = ygg.address,
+            .dest = to,
+            .len = 1,
+        };
+        packet.payload[0] = @backingInt(op);
+        return packet;
+    }
+
+    fn refill(ygg: *Yggdrasil) void {
+        const mq = &ygg.outgoing_packets;
+        const ft = &ygg.forwarding_table;
+        for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
+            if (neighbor.hello_pending) {
+                const hello = ygg.directPacket(neighbor.addr, .hello);
+                if (mq.pushMessage(neighbor.mq_idx, hello, MessageQueue.PRIORITY_HIGH)) |_| {
+                    resetLink(neighbor);
+                    neighbor.hello_pending = false;
+                } else |_| {}
+            }
+
+            if (neighbor.announce_pending) {
+                const ann = ygg.currentAnnouncement() orelse {
+                    neighbor.announce_pending = false;
+                    continue;
+                };
+                var packet = ygg.directPacket(neighbor.addr, .im_a_root);
+                packet.len = 1 + AppPacket.RootAnnouncement.LEN;
+                ann.write(packet.payload[1..][0..AppPacket.RootAnnouncement.LEN]);
+                if (mq.pushMessage(neighbor.mq_idx, packet, MessageQueue.PRIORITY_HIGH)) |_| {
+                    neighbor.announce_pending = false;
+                } else |_| {}
+            }
+        }
+    }
+
+    fn maintainJoin(ygg: *Yggdrasil, now: u32) YggdrasilError!bool {
+        if (ygg.is_root)
+            return false;
+
+        if (ygg.root != null) {
+            ygg.joining_until = null;
+            return false;
+        }
+
+        const p = ygg.power.?;
+
+        if (ygg.joining_until) |until| {
+            if (reached(now, until)) {
+                ygg.joining_until = null;
+                ygg.finishJoin(now);
+                return false;
+            }
+            if (ygg.hellos_left == 0 or !reached(now, ygg.next_hello_at))
+                return false;
+            ygg.hellos_left -= 1;
+            ygg.next_hello_at = now +% p.helloSpacingMs() +% ygg.joinJitter();
+            try ygg.sayHello();
+            return true;
+        }
+
+        const start = ygg.next_join_at orelse blk: {
+            const at = now +% ygg.joinJitter();
+            ygg.next_join_at = at;
+            break :blk at;
+        };
+        if (!reached(now, start))
+            return false;
+
+        ygg.joining_until = now +% p.scanMs();
+        ygg.hellos_left = @max(p.join_hellos, 1) - 1;
+        ygg.next_hello_at = now +% p.helloSpacingMs() +% ygg.joinJitter();
+        try ygg.sayHello();
+        return true;
+    }
+
+    fn maintainBeacon(ygg: *Yggdrasil, now: u32) void {
+        const p = ygg.power.?;
+        if (!ygg.is_root or p.root_beacon_ms == 0)
+            return;
+
+        const due = ygg.next_beacon_at orelse now;
+        if (!reached(now, due) or ygg.pending_announce != null)
+            return;
+
+        ygg.queueAnnouncement(.{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 }, now);
+        ygg.next_beacon_at = now +% p.root_beacon_ms +% ygg.random(p.root_beacon_ms / 4);
+    }
+
+    fn finishJoin(ygg: *Yggdrasil, now: u32) void {
+        const p = ygg.power.?;
+        const ft = &ygg.forwarding_table;
+        for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
+            if (neighbor.hops != NetworkPacket.NO_HOPS)
+                neighbor.hello_pending = true;
+        }
+
+        const first = @max(p.periodMs(), 4 * p.windowMs());
+        const step = if (ygg.join_backoff_ms == 0) first else ygg.join_backoff_ms *| 2;
+        const cap = if (ygg.ever_rooted) p.join_backoff_max_ms else p.join_backoff_fresh_max_ms;
+        ygg.join_backoff_ms = @min(step, @max(cap, first));
+        ygg.next_join_at = now +% ygg.join_backoff_ms +% ygg.joinJitter();
+    }
+
+    fn joinJitter(ygg: *Yggdrasil) u32 {
+        const p = ygg.power orelse return 0;
+        return ygg.random(2 * p.windowMs());
+    }
+
+    fn reportDueAt(ygg: *const Yggdrasil, p: Power) u32 {
+        if (ygg.report_at) |t| return t;
+        if (!ygg.reported_once) return ygg.currentTime();
+        return ygg.reported_at +% p.report_refresh_ms;
+    }
+
+    fn maintainReport(ygg: *Yggdrasil, now: u32) void {
+        const p = ygg.power.?;
+        if (!ygg.topology_reporting or ygg.is_root)
+            return;
+
+        const current = ygg.root orelse return;
+        if (!reached(now, ygg.reportDueAt(p)))
+            return;
+
+        const ft = &ygg.forwarding_table;
+        var own: [routing.MAX_NEIGHBORS]u16 = undefined;
+        for (ft.output_map[0..ft.num_registered_output_map], 0..) |n, i| own[i] = n.addr;
+
+        var buf: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
+        buf[0] = @backingInt(AppPacket.Opcode.topology_info);
+        const info = AppPacket.TopologyInfo.write(ygg.address, ygg.topology_seq, own[0..ft.num_registered_output_map], buf[1..]) catch return;
+
+        ygg.send(current.addr, buf[0 .. 1 + info.len], MessageQueue.PRIORITY_LOW) catch return;
+        ygg.report_at = null;
+        ygg.reported_at = now;
+        ygg.reported_once = true;
+    }
+
+    fn expireNeighbors(ygg: *Yggdrasil, now: u32) void {
+        const p = ygg.power.?;
+        if (p.neighbor_timeout_ms == 0)
+            return;
+
+        const ft = &ygg.forwarding_table;
+        const via: ?u16 = if (ygg.root) |r| r.via else null;
+        var i = ft.num_registered_output_map;
+        while (i > 0) {
+            i -= 1;
+            const neighbor = &ft.output_map[i];
+            if (!neighbor.sched_known or now -% neighbor.heard_at < p.neighbor_timeout_ms)
+                continue;
+            if (via != null and neighbor.addr == via.?)
+                continue;
+            if (ygg.outgoing_packets.tx_buffers[neighbor.mq_idx] != null)
+                continue;
+            ygg.dropNeighbor(neighbor.addr);
+        }
+    }
+
+    fn helloHeard(ygg: *Yggdrasil, addr: u16) void {
+        const p = ygg.power.?;
+        const known = ygg.forwarding_table.neighborByAddr(addr) != null;
+        const neighbor = ygg.learnNeighbor(addr) catch return;
+        if (known)
+            resetLink(neighbor);
+
+        if (ygg.currentAnnouncement() == null)
+            return;
+
+        neighbor.announce_pending = true;
+        neighbor.tx_at = ygg.currentTime() +% ygg.random(p.backoffMs());
+    }
+
+    fn learnReverse(ygg: *Yggdrasil, packet: *const NetworkPacket) void {
+        const p = ygg.power orelse return;
+        if (packet.origin == packet.from or packet.origin == ygg.address)
+            return;
+
+        const ft = &ygg.forwarding_table;
+        if (ft.route(packet.origin) != null or ft.num_forwards + 1 >= routing.MAX_NEIGHBORS)
+            return;
+
+        const via = ft.neighborByAddr(packet.from) orelse return;
+        ft.setRoute(packet.origin, via.mq_idx, p.reverse_route_hops) catch {};
+    }
+
+    fn handleDirect(ygg: *Yggdrasil, packet: *const NetworkPacket) void {
+        const app = AppPacket.parse(packet.body()) orelse return;
+        switch (app.op) {
+            .im_a_root => ygg.handleRootAnnouncement(packet.from, app.payload),
+            .topology_info => {
+                if (ygg.topology_reporting and ygg.is_root)
+                    ygg.handleTopologyInfo(packet.from, app.payload);
+            },
+            .hello => {
+                if (ygg.power == null or packet.ack)
+                    return;
+                if (ygg.currentAnnouncement() == null)
+                    return;
+                if (ygg.forwarding_table.neighborByAddr(packet.from)) |neighbor|
+                    neighbor.announce_pending = true;
+            },
+            else => {},
+        }
+    }
 
     fn currentTime(ygg: *const Yggdrasil) u32 {
         const clock = ygg.clock orelse return 0;
@@ -245,7 +827,7 @@ pub const Yggdrasil = struct {
 
         if (ygg.root) |current| {
             if (current.via == addr)
-                ygg.root = null;
+                ygg.loseRoot(ygg.currentTime());
         }
 
         ygg.neighborsChanged(false);
@@ -256,8 +838,12 @@ pub const Yggdrasil = struct {
 
     fn writePacket(ygg: *Yggdrasil, packet: *NetworkPacket) YggdrasilError!void {
         var buf: [TX_BUFFER_SIZE]u8 = undefined;
+        ygg.stamp(packet);
         packet.crc = null;
         try ygg.write_bytes_fn(packet.toBuffer(&buf));
+
+        if (ygg.power) |p|
+            ygg.stayAwake(ygg.currentTime() +% p.lingerMs(frameLen(packet)));
     }
 
     pub fn registerNeighbor(ygg: *Yggdrasil, addr: u16, slot: usize) NeighborError!*routing.MessageQueueMap {
@@ -268,13 +854,19 @@ pub const Yggdrasil = struct {
         if (slot + 1 > mq.registered_nodes)
             mq.registered_nodes = slot + 1;
 
-        if (!known)
+        if (!known) {
+            if (ygg.power != null and ygg.is_root)
+                neighbor.announce_pending = true;
             ygg.neighborsChanged(true);
+        }
 
         return neighbor;
     }
 
     pub fn announceTopology(ygg: *Yggdrasil) void {
+        if (ygg.topology_reporting and !ygg.is_root)
+            ygg.report_at = ygg.currentTime();
+
         if (!ygg.topology_flooding)
             return;
 
@@ -284,8 +876,17 @@ pub const Yggdrasil = struct {
     }
 
     fn neighborsChanged(ygg: *Yggdrasil, added: bool) void {
-        if (!ygg.topology_flooding)
+        if (ygg.topology_reporting and !ygg.is_root) {
+            const p = ygg.power orelse Power{};
+            ygg.topology_seq +%= 1;
+            if (ygg.report_at == null)
+                ygg.report_at = ygg.currentTime() +% p.report_holddown_ms;
+        }
+
+        if (!ygg.topology_flooding) {
+            ygg.recomputeRoutes();
             return;
+        }
 
         const now = ygg.currentTime();
         ygg.topology_seq +%= 1;
@@ -349,8 +950,12 @@ pub const Yggdrasil = struct {
         return packet;
     }
 
+    fn keepsTopology(ygg: *const Yggdrasil) bool {
+        return ygg.topology_flooding or (ygg.topology_reporting and ygg.is_root);
+    }
+
     fn handleTopologyInfo(ygg: *Yggdrasil, from: u16, payload: []const u8) void {
-        if (!ygg.topology_flooding)
+        if (!ygg.keepsTopology())
             return;
 
         const info = AppPacket.TopologyInfo.parse(payload) orelse return;
@@ -370,8 +975,10 @@ pub const Yggdrasil = struct {
 
         const now = ygg.currentTime();
         const entry = (ygg.topology.update(info.origin, info.seq, neighbors[0..n], now) catch return) orelse return;
-        entry.flood_pending = true;
-        entry.flood_at = now +% ygg.random(ygg.announce_jitter_ms);
+        if (ygg.topology_flooding) {
+            entry.flood_pending = true;
+            entry.flood_at = now +% ygg.random(ygg.announce_jitter_ms);
+        }
 
         ygg.recomputeRoutes();
     }
@@ -395,7 +1002,7 @@ pub const Yggdrasil = struct {
     }
 
     pub fn recomputeRoutes(ygg: *Yggdrasil) void {
-        if (!ygg.topology_flooding)
+        if (!ygg.keepsTopology())
             return;
 
         const ft = &ygg.forwarding_table;
@@ -463,6 +1070,12 @@ pub const Yggdrasil = struct {
             return;
 
         ygg.root_seq +%= 1;
+
+        if (ygg.power != null) {
+            ygg.markAnnounce(null, 0);
+            return;
+        }
+
         ygg.queueAnnouncement(.{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 }, ygg.currentTime());
     }
 
@@ -508,6 +1121,15 @@ pub const Yggdrasil = struct {
         const hops = ann.hops +| 1;
         const now = ygg.currentTime();
 
+        if (ygg.power) |p| {
+            if (hops > p.max_hops)
+                return;
+            if (ygg.root == null and !ygg.feasible(ann, now))
+                return;
+        }
+
+        const previous = ygg.root;
+
         if (ygg.root) |*current| {
             if (current.addr == ann.root) {
                 const newer = @as(i16, @bitCast(ann.seq -% current.seq)) > 0;
@@ -535,10 +1157,22 @@ pub const Yggdrasil = struct {
             .heard_at = now,
         };
 
-        ygg.queueAnnouncement(
-            .{ .root = ann.root, .seq = ann.seq, .hops = hops },
-            now +% ygg.random(ygg.announce_jitter_ms),
-        );
+        if (ygg.power == null) {
+            ygg.queueAnnouncement(
+                .{ .root = ann.root, .seq = ann.seq, .hops = hops },
+                now +% ygg.random(ygg.announce_jitter_ms),
+            );
+        } else {
+            const changed = if (previous) |prev| prev.addr != ann.root or prev.seq != ann.seq else true;
+            if (changed)
+                ygg.markAnnounce(from, hops);
+            ygg.joining_until = null;
+            ygg.hellos_left = 0;
+            ygg.join_backoff_ms = 0;
+            ygg.ever_rooted = true;
+            ygg.lost_root = null;
+            ygg.alignWindow(now);
+        }
 
         ygg.recomputeRoutes();
     }
@@ -558,9 +1192,7 @@ pub const Yggdrasil = struct {
         if (at -% current.heard_at < ygg.root_timeout_ms)
             return;
 
-        ygg.forwarding_table.removeRoute(current.addr);
-        ygg.root = null;
-        ygg.recomputeRoutes();
+        ygg.loseRoot(at);
     }
 
     pub fn sendApp(ygg: *Yggdrasil, dest: u16, app: AppPacket, priority: u8) SendError!void {
@@ -642,8 +1274,12 @@ pub const Yggdrasil = struct {
         if (AppPacket.parse(packet.body())) |app| {
             switch (app.op) {
                 .hello => {
-                    ygg.replyHello(packet.from) catch {};
-                    ygg.answerHello();
+                    if (ygg.power != null) {
+                        ygg.helloHeard(packet.from);
+                    } else {
+                        ygg.replyHello(packet.from) catch {};
+                        ygg.answerHello();
+                    }
                 },
                 .im_a_root => ygg.handleRootAnnouncement(packet.from, app.payload),
                 .topology_info => ygg.handleTopologyInfo(packet.from, app.payload),
@@ -657,6 +1293,7 @@ pub const Yggdrasil = struct {
     /// Handles network level packets that are relevant to routing tables, forwarding,
     /// etc. Passes through most (maybe all?) messages to the app level callback as well
     pub fn handle_network_packet(ygg: *Yggdrasil, packet: NetworkPacket) void {
+        ygg.noteFrame(&packet, ygg.currentTime());
         ygg.refreshDirectRoot(packet.from);
 
         if (packet.broadcast) {
@@ -671,6 +1308,9 @@ pub const Yggdrasil = struct {
             _ = ygg.learnNeighbor(packet.from) catch {};
 
         if (ygg.forwarding_table.neighborByAddr(packet.from)) |neighbor| {
+            if (ygg.power != null and isHello(&packet))
+                resetLink(neighbor);
+
             if (link_layer.isLinkOnly(&packet)) {
                 link_layer.processAck(ygg, neighbor, packet.nesn);
                 return;
@@ -680,7 +1320,10 @@ pub const Yggdrasil = struct {
                 return;
         }
 
+        ygg.learnReverse(&packet);
+
         if (packet.dest == ygg.address) {
+            ygg.handleDirect(&packet);
             ygg.result_cb(packet);
         } else {
             ygg.forward(packet);
@@ -777,11 +1420,36 @@ pub const Yggdrasil = struct {
                 if (byte > NetworkPacket.MAX_PAYLOAD_SIZE) {
                     ygg.state = .awaiting_header;
                     ygg.cursor = 0;
-                } else if (byte == 0) {
-                    ygg.state = .awaiting_crc_msb;
                 } else {
-                    ygg.state = .reading_payload;
+                    ygg.state = .awaiting_wake_hi;
                 }
+            },
+
+            .awaiting_wake_hi => {
+                ygg.building_packet.wake_in = @as(u24, byte) << 16;
+                ygg.state = .awaiting_wake_mid;
+            },
+            .awaiting_wake_mid => {
+                ygg.building_packet.wake_in |= @as(u24, byte) << 8;
+                ygg.state = .awaiting_wake_lo;
+            },
+            .awaiting_wake_lo => {
+                ygg.building_packet.wake_in |= byte;
+                ygg.state = .awaiting_period_msb;
+            },
+
+            .awaiting_period_msb => {
+                ygg.building_packet.period = @as(u16, byte) << 8;
+                ygg.state = .awaiting_period_lsb;
+            },
+            .awaiting_period_lsb => {
+                ygg.building_packet.period |= byte;
+                ygg.state = .awaiting_hops;
+            },
+
+            .awaiting_hops => {
+                ygg.building_packet.hops = byte;
+                ygg.state = if (ygg.building_packet.len == 0) .awaiting_crc_msb else .reading_payload;
             },
             .reading_payload => {
                 ygg.building_packet.payload[ygg.cursor - NetworkPacket.HEADER_LEN - 1] = byte;
@@ -1375,6 +2043,8 @@ test "root routes expire without fresh announcements" {
 }
 
 test {
+    _ = @import("lora.zig");
+    _ = @import("power.zig");
     _ = @import("network_packet.zig");
     _ = @import("app_packet.zig");
     _ = @import("routing.zig");

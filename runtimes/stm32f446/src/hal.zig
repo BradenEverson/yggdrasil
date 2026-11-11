@@ -4,6 +4,8 @@ pub const gpio = @import("hal/gpio.zig");
 pub const uart = @import("hal/uart.zig");
 pub const i2c = @import("hal/i2c.zig");
 pub const timer = @import("hal/timer.zig");
+pub const rtc = @import("hal/rtc.zig");
+pub const lowpower = @import("hal/lowpower.zig");
 
 fn copyForward(dest: [*]volatile u8, src: [*]const u8, n: usize) void {
     var i: usize = 0;
@@ -78,5 +80,13 @@ export fn __aeabi_unwind_cpp_pr0() void {}
 export fn __aeabi_unwind_cpp_pr1() void {}
 
 export fn Default_Handler() void {
+    while (true) {}
+}
+
+const SCB_AIRCR: *volatile u32 = @ptrFromInt(0xE000_ED0C);
+
+pub fn reset() noreturn {
+    asm volatile ("dsb");
+    SCB_AIRCR.* = 0x05FA_0004;
     while (true) {}
 }

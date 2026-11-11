@@ -2,7 +2,7 @@
 
 const rcc = @import("rcc.zig");
 
-pub const Port = enum(u3) { a, b, c, d, e };
+pub const Port = enum(u3) { a, b, c, d, e, f, g, h };
 
 pub const Pin = struct {
     port: Port,
@@ -31,6 +31,22 @@ fn setMode(port: Port, pin: u4, mode: Mode) void {
 
 pub fn enable(port: Port) void {
     rcc.ahb1enr.* |= @as(u32, 1) << @intFromEnum(port);
+}
+
+pub fn disable(port: Port) void {
+    rcc.ahb1enr.* &= ~(@as(u32, 1) << @intFromEnum(port));
+}
+
+pub fn analogMask(port: Port, mask: u16) void {
+    var moder_bits: u32 = 0;
+    var pull_bits: u32 = 0;
+    for (0..16) |i| {
+        if (mask & (@as(u16, 1) << @intCast(i)) == 0) continue;
+        moder_bits |= @as(u32, 0b11) << @intCast(i * 2);
+        pull_bits |= @as(u32, 0b11) << @intCast(i * 2);
+    }
+    reg(port, pupdr).* &= ~pull_bits;
+    reg(port, moder).* |= moder_bits;
 }
 
 pub fn output(port: Port, pin: u4) void {

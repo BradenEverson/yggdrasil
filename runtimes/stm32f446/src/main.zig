@@ -12,18 +12,45 @@ const BAUD_RATE = 115200;
 const LORA_TX_SIZE = 256;
 const LORA_LINE_SIZE = 32;
 const YGG_RX_SIZE = 64;
+const MAX_WRITES_PER_PASS = 4;
+const FAIL_RETRY_MS: u32 = 60_000;
 
 const NETWORK_ID: u16 = 5;
 const NODE_ADDR: u16 = node_config.node_addr;
-const SAMPLE_PERIOD_MS: u32 = 30_000;
-const SAMPLE_JITTER_MS: u32 = 3_000;
-const ROOT_TIMEOUT_MS: u32 = 450_000;
-const HELLO_PERIOD_MS: u32 = 10_000;
-const HELLO_JITTER_MS: u32 = 2_000;
-const TX_JITTER_MS: u32 = 300;
-const RETRANSMIT_TIMEOUT_MS: u32 = 4_000;
-const RETRANSMIT_JITTER_MS: u32 = 1_500;
+const PERIOD_MS: u32 = node_config.period_ms;
 const RADIO_BROADCAST_ADDR: u16 = 0;
+
+const RADIO: yggdrasil.lora.Radio = .{
+    .spreading_factor = node_config.sf,
+    .bandwidth_hz = node_config.bw,
+    .coding_rate = node_config.cr,
+    .preamble = node_config.preamble,
+    .uart_baud = BAUD_RATE,
+};
+
+const POWER: yggdrasil.Power = .{
+    .period_ms = PERIOD_MS,
+    .radio = RADIO,
+    .radio_wake_ms = node_config.radio_wake_ms,
+    .neighbor_timeout_ms = 30 * PERIOD_MS,
+};
+
+comptime {
+    if (PERIOD_MS % yggdrasil.power.PERIOD_UNIT_MS != 0 or PERIOD_MS == 0)
+        @compileError("period_ms must be a nonzero multiple of 100");
+}
+
+const used_pins = [_]hal.gpio.Pin{
+    .{ .port = .a, .num = 2 },
+    .{ .port = .a, .num = 3 },
+    .{ .port = .a, .num = 9 },
+    .{ .port = .a, .num = 10 },
+    .{ .port = .b, .num = 8 },
+    .{ .port = .b, .num = 9 },
+} ++ if (node_config.swd) [_]hal.gpio.Pin{
+    .{ .port = .a, .num = 13 },
+    .{ .port = .a, .num = 14 },
+} else [_]hal.gpio.Pin{};
 
 var lora_rx: [LORA_LINE_SIZE]u8 = undefined;
 var lora_tx: [LORA_TX_SIZE]u8 = undefined;
@@ -31,14 +58,28 @@ var ygg_rx: [YGG_RX_SIZE]u8 = undefined;
 
 var lora: Rylr = undefined;
 var ygg: yggdrasil.Yggdrasil = undefined;
+var radio_awake = false;
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    if (!node_config.log) return;
+    hal.uart.print(debug, fmt, args);
+}
 
 fn radioRead(buf: []u8) yggdrasil.YggdrasilError![]u8 {
     return lora.read(buf);
 }
 
+fn traceFrame(dir: []const u8, f: []const u8) void {
+    if (!node_config.trace or f.len < yggdrasil.NetworkPacket.HEADER_LEN) return;
+    const from = (@as(u16, f[1]) << 8) | f[2];
+    const to = (@as(u16, f[3]) << 8) | f[4];
+    log("{s} {}>{} len={} f={x} t={}\r\n", .{ dir, from, to, f[11], f[10], hal.timer.millis() });
+}
+
 fn radioWrite(buf: []u8) yggdrasil.YggdrasilError!void {
+    traceFrame("tx", buf);
     lora.sendData(RADIO_BROADCAST_ADDR, buf) catch |e| {
-        hal.uart.print(debug, "radio send failed: {s}\r\n", .{@errorName(e)});
+        log("send failed: {s}\r\n", .{@errorName(e)});
         return error.WriteFailed;
     };
 }
@@ -46,11 +87,11 @@ fn radioWrite(buf: []u8) yggdrasil.YggdrasilError!void {
 fn onPacket(packet: yggdrasil.NetworkPacket) void {
     const parsed = yggdrasil.AppPacket.parse(packet.body());
     const op = if (parsed) |packet_app| @tagName(packet_app.op) else "raw";
-    hal.uart.print(debug, "rx {} via {} {s} len={} ttl={}\r\n", .{ packet.origin, packet.from, op, packet.len, packet.ttl });
+    log("rx {} via {} {s}\r\n", .{ packet.origin, packet.from, op });
 }
 
 fn onNeighborLost(addr: u16) void {
-    hal.uart.print(debug, "lost neighbor {}\r\n", .{addr});
+    log("lost neighbor {}\r\n", .{addr});
 }
 
 var rng_state: u32 = 0;
@@ -68,8 +109,11 @@ fn reached(now: u32, deadline: u32) bool {
 }
 
 fn fail(what: []const u8, err: anyerror) noreturn {
-    hal.uart.print(debug, "{s} failed: {s}\r\n", .{ what, @errorName(err) });
-    while (true) {}
+    log("{s} failed: {s}\r\n", .{ what, @errorName(err) });
+    sleepRadio();
+    quiesce();
+    if (hal.rtc.ready) hal.lowpower.stopFor(FAIL_RETRY_MS);
+    hal.reset();
 }
 
 const CPACR: *volatile u32 = @ptrFromInt(0xE000_ED88);
@@ -98,14 +142,67 @@ export fn run() void {
     @call(.never_inline, app, .{});
 }
 
-fn app() void {
-    hal.uart.init(debug, .{
-        .baud = BAUD_RATE,
-        .tx = .{ .port = .a, .num = 2 },
-        .rx = .{ .port = .a, .num = 3 },
+fn quiesce() void {
+    if (node_config.log) hal.uart.flush(debug);
+    hal.uart.flush(lora_uart);
+}
+
+fn sleepRadio() void {
+    if (!node_config.radio_sleep or !radio_awake) return;
+    lora.sleep() catch |e| {
+        log("radio sleep failed: {s}\r\n", .{@errorName(e)});
+        return;
+    };
+    radio_awake = false;
+}
+
+var wake_reported = false;
+var seen_frames: u32 = 0;
+
+fn wakeRadio() void {
+    if (radio_awake) return;
+    const start = hal.timer.millis();
+    lora.wake() catch |e| {
+        log("radio wake failed: {s}\r\n", .{@errorName(e)});
+        lora.reset();
+        hal.timer.delayMs(1000);
+        configureRadio() catch |err| fail("radio config", err);
+    };
+    radio_awake = true;
+    const took = hal.timer.millis() -% start;
+    if (!wake_reported or took > POWER.radio_wake_ms) {
+        wake_reported = true;
+        log("radio wake took {} ms\r\n", .{took});
+    }
+}
+
+fn configureRadio() Rylr.RylrError!void {
+    while (hal.uart.tryReadByte(lora_uart)) |_| {}
+    try lora.setNetwork(NETWORK_ID);
+    try lora.setAddr(NODE_ADDR);
+    try lora.setParameters(.{
+        .spreading_factor = RADIO.spreading_factor,
+        .bandwidth = Rylr.Bandwidth.fromHz(RADIO.bandwidth_hz),
+        .coding_rate = RADIO.coding_rate,
+        .preamble = RADIO.preamble,
     });
+    try lora.setPower(node_config.tx_power);
+}
+
+fn app() void {
+    hal.lowpower.parkUnusedPins(&used_pins);
+
+    if (node_config.log) {
+        hal.uart.init(debug, .{
+            .baud = BAUD_RATE,
+            .tx = .{ .port = .a, .num = 2 },
+            .rx = .{ .port = .a, .num = 3 },
+        });
+    }
 
     hal.timer.init(16_000_000);
+    const clock_source = hal.rtc.init();
+    log("rtc on {s}\r\n", .{@tagName(clock_source)});
 
     hal.i2c.init(.i2c1, .{
         .scl = .{ .port = .b, .num = 8 },
@@ -114,10 +211,6 @@ fn app() void {
     });
 
     var sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, .{}) catch |e| fail("BME688 init", e);
-
-    hal.uart.writeStr(debug, "Restarting LoRA Module\r\n");
-
-    hal.uart.writeStr(debug, "Let's Mesh This Network\r\n");
 
     lora = .{
         .uart = lora_uart,
@@ -131,21 +224,14 @@ fn app() void {
         .rx = .{ .port = .a, .num = 10 },
     });
 
-    hal.uart.writeStr(debug, "UART ready\r\n");
-
     lora.reset();
     hal.timer.delayMs(1000);
     while (hal.uart.tryReadByte(lora_uart)) |_| {}
-
     hal.uart.enableRxInterrupt(lora_uart);
 
-    hal.uart.print(debug, "Configuring network id={} addr={}\r\n", .{ NETWORK_ID, NODE_ADDR });
-
-    lora.setNetwork(NETWORK_ID) catch |e| fail("setNetwork", e);
-    hal.timer.delayMs(200);
-
-    lora.setAddr(NODE_ADDR) catch |e| fail("setAddr", e);
-    hal.timer.delayMs(5000);
+    configureRadio() catch |e| fail("radio config", e);
+    radio_awake = true;
+    log("node {} sf{} period {} ms\r\n", .{ NODE_ADDR, RADIO.spreading_factor, PERIOD_MS });
 
     ygg = .{
         .read_bytes_fn = radioRead,
@@ -154,57 +240,87 @@ fn app() void {
         .address = NODE_ADDR,
         .clock = hal.timer.millis,
         .neighbor_lost_cb = onNeighborLost,
-        .retransmit_timeout_ms = RETRANSMIT_TIMEOUT_MS,
-        .retransmit_jitter_ms = RETRANSMIT_JITTER_MS,
-        .root_timeout_ms = ROOT_TIMEOUT_MS,
+        .root_timeout_ms = 6 * PERIOD_MS,
+        .max_retries = 10,
+        .power = POWER,
+        .topology_flooding = false,
+        .topology_reporting = true,
         .outgoing_packets = .{ .slots = undefined, .tx_buffers = undefined },
     };
     for (0..yggdrasil.MessageQueue.MAX_NEIGHBORS) |slot| ygg.outgoing_packets.clearSlot(slot);
     ygg.buffer = &ygg_rx;
 
-    hal.uart.print(debug, "Node {} ready\r\n", .{NODE_ADDR});
+    log("window {} ms\r\n", .{POWER.windowMs()});
 
     var known_root: ?u16 = null;
-    var next_hello: u32 = hal.timer.millis() +% random(HELLO_JITTER_MS);
-    var next_write: u32 = hal.timer.millis();
-    var next_sample: u32 = hal.timer.millis();
+    var next_sample: u32 = hal.timer.millis() +% random(PERIOD_MS);
 
     while (true) {
-        ygg.readStream() catch |e| {
-            hal.uart.print(debug, "read failed: {s}\r\n", .{@errorName(e)});
-        };
-
         const now = hal.timer.millis();
 
-        if (reached(now, next_write)) {
-            _ = ygg.requestWrite() catch {};
-            next_write = hal.timer.millis() +% random(TX_JITTER_MS);
-        }
-
-        const current_root = ygg.rootAddress();
-        if (current_root != known_root) {
-            known_root = current_root;
-            if (ygg.root) |root|
-                hal.uart.print(debug, "root {} via {} hops={}\r\n", .{ root.addr, root.via, root.hops })
-            else
-                hal.uart.writeStr(debug, "root lost\r\n");
-        }
-
-        if (current_root == null and reached(now, next_hello)) {
-            ygg.sayHello() catch {};
-            next_hello = hal.timer.millis() +% HELLO_PERIOD_MS +% random(HELLO_JITTER_MS);
-        }
-
-        if (reached(now, next_sample)) {
-            next_sample = now +% SAMPLE_PERIOD_MS -% SAMPLE_JITTER_MS +% random(2 * SAMPLE_JITTER_MS);
+        const overdue = reached(now, next_sample +% PERIOD_MS / 4);
+        if (reached(now, next_sample) and (overdue or ygg.idleFor() != 0)) {
+            next_sample +%= PERIOD_MS;
+            if (reached(now, next_sample)) next_sample = now +% PERIOD_MS;
             sample(&ygg, &sensor);
         }
+
+        if (ygg.idleFor() == 0) {
+            wakeRadio();
+
+            ygg.readStream() catch |e| log("read failed: {s}\r\n", .{@errorName(e)});
+            if (lora.received != seen_frames) {
+                seen_frames = lora.received;
+                traceFrame("rx", lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)]);
+            }
+
+            var writes: usize = 0;
+            while (writes < MAX_WRITES_PER_PASS) : (writes += 1) {
+                const wrote = ygg.requestWrite() catch false;
+                if (!wrote) break;
+            }
+
+            const current_root = ygg.rootAddress();
+            if (current_root != known_root) {
+                known_root = current_root;
+                if (ygg.root) |r|
+                    log("root {} via {} hops={}\r\n", .{ r.addr, r.via, r.hops })
+                else
+                    log("root lost\r\n", .{});
+            }
+
+            if (ygg.idleFor() == 0) hal.lowpower.idle();
+            continue;
+        }
+
+        ygg.readStream() catch {};
+        sleepRadio();
+
+        const idle = ygg.idleFor();
+        if (idle == 0) continue;
+
+        if (!node_config.radio_sleep) {
+            hal.lowpower.idle();
+            continue;
+        }
+
+        const until_sample = next_sample -% hal.timer.millis();
+        const nap = @min(idle, until_sample);
+        if (nap < hal.lowpower.MIN_STOP_MS) {
+            hal.lowpower.idle();
+            continue;
+        }
+
+        quiesce();
+        hal.lowpower.stopFor(nap);
     }
 }
 
 fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688) void {
+    if (node.rootAddress() == null) return;
+
     const r = sensor.measure() catch |e| {
-        hal.uart.print(debug, "measure failed: {s}\r\n", .{@errorName(e)});
+        log("measure failed: {s}\r\n", .{@errorName(e)});
         return;
     };
 
@@ -212,14 +328,14 @@ fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688) void {
     var readings = yggdrasil.AppPacket.SensorReadingWriter{ .buf = &readings_buf };
 
     addReadings(&readings, r) catch |e| {
-        hal.uart.print(debug, "encode failed: {s}\r\n", .{@errorName(e)});
+        log("encode failed: {s}\r\n", .{@errorName(e)});
         return;
     };
 
     const packet: yggdrasil.AppPacket = .{ .op = .sensor_readings, .payload = readings.written() };
 
     node.sendAppToRoot(packet, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
-        hal.uart.print(debug, "send failed: {s}\r\n", .{@errorName(e)});
+        log("send failed: {s}\r\n", .{@errorName(e)});
     };
 }
 

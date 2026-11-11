@@ -16,6 +16,14 @@ inbox_head: u32 = 0,
 inbox_tail: u32 = 0,
 inbox_dropped: u32 = 0,
 
+params: ?Parameters = null,
+power_dbm: ?u4 = null,
+
+received: u32 = 0,
+last_rx: [FRAME_PEEK]u8 = undefined,
+last_rx_len: usize = 0,
+rx_index: usize = 0,
+
 const Self = @This();
 
 pub const RylrError = error{
@@ -38,9 +46,49 @@ const LineState = enum { text, rcv_addr, rcv_len, rcv_data, rcv_trailer };
 
 const Response = union(enum) {
     ok,
+    ready,
     err: RylrError,
     other,
 };
+
+pub const Bandwidth = enum(u4) {
+    khz7_8 = 0,
+    khz10_4 = 1,
+    khz15_6 = 2,
+    khz20_8 = 3,
+    khz31_25 = 4,
+    khz41_7 = 5,
+    khz62_5 = 6,
+    khz125 = 7,
+    khz250 = 8,
+    khz500 = 9,
+
+    pub fn fromHz(hz: u32) Bandwidth {
+        return switch (hz) {
+            7_800 => .khz7_8,
+            10_400 => .khz10_4,
+            15_600 => .khz15_6,
+            20_800 => .khz20_8,
+            31_250 => .khz31_25,
+            41_700 => .khz41_7,
+            62_500 => .khz62_5,
+            250_000 => .khz250,
+            500_000 => .khz500,
+            else => .khz125,
+        };
+    }
+};
+
+pub const Parameters = struct {
+    spreading_factor: u4 = 9,
+    bandwidth: Bandwidth = .khz125,
+    coding_rate: u3 = 1,
+    preamble: u8 = 4,
+};
+
+const WAKE_TIMEOUT_MS: u32 = 600;
+const WAKE_ATTEMPTS: u32 = 4;
+pub const FRAME_PEEK: usize = 18;
 
 pub fn reset(self: *Self) void {
     self.line_state = .text;
@@ -80,6 +128,9 @@ fn pushInbox(self: *Self, byte: u8) void {
 fn feed(self: *Self, byte: u8) ?Response {
     switch (self.line_state) {
         .text => {
+            if (self.line_len == 0 and byte != '+')
+                return null;
+
             if (self.line_len < self.rx_buffer.len) {
                 self.rx_buffer[self.line_len] = byte;
                 self.line_len += 1;
@@ -106,6 +157,8 @@ fn feed(self: *Self, byte: u8) ?Response {
         .rcv_len => {
             if (byte == ',') {
                 self.line_state = if (self.rcv_remaining == 0) .rcv_trailer else .rcv_data;
+                self.last_rx_len = self.rcv_remaining;
+                self.rx_index = 0;
             } else if (byte >= '0' and byte <= '9' and self.rcv_remaining < 1000) {
                 self.rcv_remaining = self.rcv_remaining * 10 + (byte - '0');
             } else {
@@ -113,10 +166,14 @@ fn feed(self: *Self, byte: u8) ?Response {
             }
         },
         .rcv_data => {
+            if (self.rx_index < FRAME_PEEK) self.last_rx[self.rx_index] = byte;
+            self.rx_index += 1;
             self.pushInbox(byte);
             self.rcv_remaining -= 1;
-            if (self.rcv_remaining == 0)
+            if (self.rcv_remaining == 0) {
                 self.line_state = .rcv_trailer;
+                self.received +%= 1;
+            }
         },
         .rcv_trailer => {
             if (byte == '\n')
@@ -130,6 +187,9 @@ fn feed(self: *Self, byte: u8) ?Response {
 fn classify(line: []const u8) Response {
     if (std.mem.startsWith(u8, line, "+OK"))
         return .ok;
+
+    if (std.mem.startsWith(u8, line, "+READY"))
+        return .ready;
 
     if (std.mem.startsWith(u8, line, "+ERR=")) {
         const code_str = std.mem.trimEnd(u8, line["+ERR=".len..], "\r\n");
@@ -151,20 +211,77 @@ fn classify(line: []const u8) Response {
 }
 
 fn send(self: *Self, msg: []const u8) RylrError!void {
+    return self.command(msg, self.timeout_ms);
+}
+
+fn command(self: *Self, msg: []const u8, timeout_ms: u32) RylrError!void {
     self.poll();
     hal.uart.writeStr(self.uart, msg);
+    return self.awaitReply(timeout_ms, false);
+}
 
+fn awaitReply(self: *Self, timeout_ms: u32, accept_ready: bool) RylrError!void {
     const start = hal.timer.millis();
-    while (hal.timer.millis() -% start < self.timeout_ms) {
+    while (hal.timer.millis() -% start < timeout_ms) {
         const byte = hal.uart.tryReadByte(self.uart) orelse continue;
         switch (self.feed(byte) orelse continue) {
             .ok => return,
-            .err => |e| return e,
+            .ready => if (accept_ready) return,
+            .err => |e| if (!accept_ready) return e,
             .other => {},
         }
     }
 
     return RylrError.Timeout;
+}
+
+pub fn sleep(self: *Self) RylrError!void {
+    try self.send("AT+MODE=1\r\n");
+    hal.uart.flush(self.uart);
+}
+
+pub fn wake(self: *Self) RylrError!void {
+    self.line_state = .text;
+    self.line_len = 0;
+
+    var attempt: u32 = 0;
+    while (attempt < WAKE_ATTEMPTS) : (attempt += 1) {
+        self.line_len = 0;
+        hal.uart.writeStr(self.uart, "AT\r\n");
+        self.awaitReply(WAKE_TIMEOUT_MS, true) catch continue;
+        self.line_len = 0;
+        self.restore() catch continue;
+        return;
+    }
+
+    return RylrError.Timeout;
+}
+
+fn restore(self: *Self) RylrError!void {
+    if (self.params) |params| try self.setParameters(params);
+    if (self.power_dbm) |dbm| try self.setPower(dbm);
+}
+
+pub fn setParameters(self: *Self, params: Parameters) RylrError!void {
+    const msg = std.mem.print(
+        self.tx_buffer,
+        "AT+PARAMETER={},{},{},{}\r\n",
+        .{ params.spreading_factor, @intFromEnum(params.bandwidth), params.coding_rate, params.preamble },
+    ) catch return RylrError.BufferTooSmall;
+
+    try self.send(msg);
+    self.params = params;
+}
+
+pub fn setPower(self: *Self, dbm: u4) RylrError!void {
+    const msg = std.mem.print(
+        self.tx_buffer,
+        "AT+CRFOP={}\r\n",
+        .{dbm},
+    ) catch return RylrError.BufferTooSmall;
+
+    try self.send(msg);
+    self.power_dbm = dbm;
 }
 
 pub fn setNetwork(self: *Self, net: u16) RylrError!void {

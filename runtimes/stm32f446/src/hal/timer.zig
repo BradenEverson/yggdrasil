@@ -1,5 +1,7 @@
 //! SysTick-based millisecond timer
 
+const rtc = @import("rtc.zig");
+
 const SYSTICK_BASE = 0xE000_E010;
 const STK_CTRL = @as(*volatile u32, @ptrFromInt(SYSTICK_BASE + 0x00));
 const STK_LOAD = @as(*volatile u32, @ptrFromInt(SYSTICK_BASE + 0x04));
@@ -21,7 +23,17 @@ pub fn init(cpu_freq_hz: u32) void {
 }
 
 pub fn millis() u32 {
+    if (rtc.ready) return rtc.millis();
     return @atomicLoad(u32, &ticks, .monotonic);
+}
+
+pub fn pause() void {
+    STK_CTRL.* &= ~CTRL_TICKINT;
+}
+
+pub fn unpause() void {
+    STK_VAL.* = 0;
+    STK_CTRL.* |= CTRL_TICKINT;
 }
 
 pub fn delayMs(ms: u32) void {

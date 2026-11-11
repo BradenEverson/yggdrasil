@@ -234,6 +234,10 @@ export fn USART1_IRQHandler() void {
     handleRx(.usart1);
 }
 
+pub fn flush(uart: Uart) void {
+    while ((reg(uart, sr).* & 0x0040) == 0) {}
+}
+
 pub fn writeStr(uart: Uart, str: []const u8) void {
     for (str) |c| writeByte(uart, c);
 }

@@ -440,8 +440,8 @@ fn writeSnapshot(w: *Writer, node: *Node) Writer.Error!void {
 
 fn writePacket(w: *Writer, p: *const NetworkPacket) Writer.Error!void {
     try w.print(
-        "{{\"from\":{d},\"to\":{d},\"origin\":{d},\"dest\":{d},\"ttl\":{d},\"ack\":{},\"broadcast\":{},\"nack\":{},\"sn\":{},\"nesn\":{},\"len\":{d},\"crc\":",
-        .{ p.from, p.to, p.origin, p.dest, p.ttl, p.ack, p.broadcast, p.nack, p.sn, p.nesn, p.len },
+        "{{\"from\":{d},\"to\":{d},\"origin\":{d},\"dest\":{d},\"ttl\":{d},\"ack\":{},\"broadcast\":{},\"nack\":{},\"sn\":{},\"nesn\":{},\"len\":{d},\"wake_in\":{d},\"period\":{d},\"hops\":{d},\"crc\":",
+        .{ p.from, p.to, p.origin, p.dest, p.ttl, p.ack, p.broadcast, p.nack, p.sn, p.nesn, p.len, p.wake_in, p.period, p.hops },
     );
     try writeValue(w, p.crc);
     try w.writeAll(",\"payload\":");
