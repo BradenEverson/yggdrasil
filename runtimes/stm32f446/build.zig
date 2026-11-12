@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
 
     const obj = b.addObject(.{
-        .name = "ztm32",
+        .name = "yggdrasil",
         .root_module = b.createModule(.{
             .optimize = optimize,
             .target = target,
@@ -48,13 +48,13 @@ pub fn build(b: *std.Build) void {
     obj.root_module.addOptions("node_config", node_config);
 
     const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "--gc-sections", "-T", "flash.ld", "-o" });
-    const elf_file = ld_cmd.addOutputFileArg("ztm32.elf");
+    const elf_file = ld_cmd.addOutputFileArg("yggdrasil.elf");
     ld_cmd.addArtifactArg(obj);
 
     const objcopy_cmd = b.addSystemCommand(&.{ "arm-none-eabi-objcopy", "-O", "binary" });
     objcopy_cmd.addFileArg(elf_file);
-    const bin_file = objcopy_cmd.addOutputFileArg("ztm32.bin");
+    const bin_file = objcopy_cmd.addOutputFileArg("yggdrasil.bin");
 
-    const install_bin = b.addInstallFile(bin_file, "ztm32.bin");
+    const install_bin = b.addInstallFile(bin_file, "yggdrasil.bin");
     b.getInstallStep().dependOn(&install_bin.step);
 }
