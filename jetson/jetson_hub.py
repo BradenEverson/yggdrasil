@@ -2,7 +2,10 @@ import argparse
 import csv
 import os
 import random
+import select
+import struct
 import time
+import websocket
 from datetime import datetime
 
 import yggdrasil
@@ -14,6 +17,8 @@ ROOT_ANNOUNCE_PERIOD_S = 15 * 60.0
 ROOT_ANNOUNCE_JITTER_S = 30.0
 LOOP_SLEEP_S = 0.005
 RADIO_CHECK_PERIOD_S = 60.0
+WS_CONNECT_TIMEOUT_S = 3.0
+WS_RECONNECT_PERIOD_S = 10.0
 ROOT_BEACON_MS = 20_000
 
 BANDWIDTH_CODES = {
@@ -71,6 +76,70 @@ class CsvLog(object):
         self.file.close()
 
 
+class WebSocketStream(object):
+    def __init__(self, url):
+        self._websocket = websocket
+        self.url = url
+        self.ws = None
+        self.next_attempt = 0.0
+        self.connect()
+
+    def connect(self):
+        now = time.monotonic()
+        if now < self.next_attempt:
+            return False
+        self.next_attempt = now + WS_RECONNECT_PERIOD_S
+        try:
+            self.ws = self._websocket.create_connection(self.url, timeout=WS_CONNECT_TIMEOUT_S)
+            print(f"Connected to {self.url}")
+            return True
+        except Exception as e:
+            print(f"Websocket connect to {self.url} failed: {e}")
+            self.ws = None
+            return False
+
+    def drop(self, reason):
+        print(f"Websocket {self.url} disconnected: {reason}")
+        try:
+            self.ws.close(timeout=0.5)
+        except Exception:
+            pass
+        self.ws = None
+        self.next_attempt = 0.0
+
+    def send(self, payload):
+        if self.ws is None and not self.connect():
+            print("Websocket unavailable, dropping reading")
+            return False
+        try:
+            self.ws.send_binary(payload)
+            return True
+        except Exception as e:
+            self.drop(e)
+            print("Dropped reading")
+            return False
+
+    def poll(self):
+        if self.ws is None:
+            return
+        try:
+            while select.select([self.ws.sock], [], [], 0)[0]:
+                opcode, _ = self.ws.recv_data_frame(control_frame=True)
+                if opcode == self._websocket.ABNF.OPCODE_CLOSE:
+                    self.drop("closed by server")
+                    return
+        except Exception as e:
+            self.drop(e)
+
+    def close(self):
+        if self.ws is not None:
+            try:
+                self.ws.close(timeout=0.5)
+            except Exception:
+                pass
+            self.ws = None
+
+
 def describe_frame(frame):
     if len(frame) < 18 or frame[0] != 0x72:
         return f"(not a frame, {len(frame)} bytes)"
@@ -87,9 +156,10 @@ def describe_frame(frame):
 
 
 class Hub(object):
-    def __init__(self, radio, log, address, sf, bandwidth_hz, coding_rate, preamble, tx_power, trace=False):
+    def __init__(self, radio, log, stream, address, sf, bandwidth_hz, coding_rate, preamble, tx_power, trace=False):
         self.trace = trace
         self.radio = radio
+        self.stream = stream
         self.parameter = f"{sf},{BANDWIDTH_CODES[bandwidth_hz]},{coding_rate},{preamble}"
         self.tx_power = tx_power
         self.seen_resets = radio.resets
@@ -147,6 +217,12 @@ class Hub(object):
 
     def on_readings(self, origin, from_addr, payload):
         readings = yggdrasil.parse_sensor_readings(payload)
+        pretty = "  ".join(f"{n}={v:.2f}" if isinstance(v, float) else f"{n}={v}" for n, v in readings)
+        print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}): {pretty}")
+
+        if self.stream is not None:
+            self.stream.send(struct.pack(">H", origin) + bytes(payload))
+            return
 
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -165,9 +241,6 @@ class Hub(object):
             else:
                 extra.append(f"{name}={value}")
         row["extra"] = ";".join(extra)
-
-        pretty = "  ".join(f"{n}={v:.2f}" if isinstance(v, float) else f"{n}={v}" for n, v in readings)
-        print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}): {pretty}")
         self.log.write(row)
 
     @staticmethod
@@ -186,6 +259,8 @@ class Hub(object):
         while True:
             self.node.tick()
             self.radio.poll()
+            if self.stream is not None:
+                self.stream.poll()
 
             now = time.monotonic()
             if now >= next_radio_check or self.radio.resets != self.seen_resets:
@@ -211,7 +286,8 @@ class Hub(object):
 def main():
     parser = argparse.ArgumentParser(description="Yggdrasil hub for the Jetson Nano")
     parser.add_argument("--address", type=int, default=100, help="Yggdrasil/LoRa address of the hub")
-    parser.add_argument("--csv", default="log.csv", help="CSV file to append readings to")
+    parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:8765/readings) to stream raw reading payloads to; CSV logging is used if omitted")
+    parser.add_argument("--csv", default="log.csv", help="CSV file to append readings to when --ws is not given")
     parser.add_argument("--port", default="/dev/ttyTHS1", help="RYLR896 serial port")
     parser.add_argument("--sf", type=int, default=9, help="LoRa spreading factor (7-12), must match every node")
     parser.add_argument("--bw", type=int, default=125000, choices=sorted(BANDWIDTH_CODES), help="LoRa bandwidth in Hz")
@@ -223,8 +299,14 @@ def main():
 
     print("Jetson Nano Hub!")
 
-    log = CsvLog(args.csv)
-    print(f"Logging to {os.path.abspath(args.csv)}")
+    stream = None
+    log = None
+    if args.ws is not None:
+        stream = WebSocketStream(args.ws)
+        print(f"Streaming readings to {args.ws}")
+    else:
+        log = CsvLog(args.csv)
+        print(f"Logging to {os.path.abspath(args.csv)}")
 
     radio = RYLR896(port=args.port)
     try:
@@ -238,7 +320,7 @@ def main():
         radio.send_command("AT+NETWORKID?")
         radio.send_command("AT+PARAMETER?")
 
-        hub = Hub(radio, log, args.address, args.sf, args.bw, args.cr, args.preamble, args.power, trace=args.trace)
+        hub = Hub(radio, log, stream, args.address, args.sf, args.bw, args.cr, args.preamble, args.power, trace=args.trace)
         radio.on_receive = hub.on_radio
         hub.run()
 
@@ -246,7 +328,10 @@ def main():
         print("\nShutting down.")
     finally:
         radio.close()
-        log.close()
+        if log is not None:
+            log.close()
+        if stream is not None:
+            stream.close()
 
 
 if __name__ == "__main__":
