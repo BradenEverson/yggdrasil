@@ -52,6 +52,8 @@ def _load(path):
     lib.ygg_configure_power.restype = None
     lib.ygg_set_root_beacon.argtypes = [ctypes.c_uint32]
     lib.ygg_set_root_beacon.restype = None
+    lib.ygg_set_max_children.argtypes = [ctypes.c_uint32]
+    lib.ygg_set_max_children.restype = None
     lib.ygg_set_root_seq.argtypes = [ctypes.c_uint16]
     lib.ygg_set_root_seq.restype = None
     lib.ygg_idle_for.argtypes = []
@@ -126,6 +128,9 @@ class Node(object):
 
     def set_root_beacon(self, period_ms):
         self._lib.ygg_set_root_beacon(period_ms)
+
+    def set_max_children(self, max_children):
+        self._lib.ygg_set_max_children(max_children)
 
     def set_root_seq(self, seq):
         self._lib.ygg_set_root_seq(seq & 0xFFFF)

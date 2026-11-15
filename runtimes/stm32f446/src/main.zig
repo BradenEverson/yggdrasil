@@ -32,6 +32,7 @@ const POWER: yggdrasil.Power = .{
     .period_ms = PERIOD_MS,
     .radio = RADIO,
     .radio_wake_ms = node_config.radio_wake_ms,
+    .beacon_periods = node_config.beacon_periods,
     .neighbor_timeout_ms = 30 * PERIOD_MS,
 };
 
