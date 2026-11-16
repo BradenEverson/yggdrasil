@@ -27,7 +27,7 @@ comptime {
 }
 
 pub const SendError = error{ NoRoute, PayloadTooLarge } || MessageQueue.PushError;
-pub const NeighborError = ForwardingTable.Error;
+pub const NeighborError = ForwardingTable.Error || error{AtCapacity};
 
 pub const RootRoute = struct {
     addr: u16,
@@ -35,6 +35,12 @@ pub const RootRoute = struct {
     hops: u8,
     seq: u16,
     heard_at: u32,
+};
+
+const JoinCandidate = struct {
+    ann: AppPacket.RootAnnouncement,
+    via: u16,
+    hops: u8,
 };
 
 /// The states we can be in while reading
@@ -108,6 +114,7 @@ pub const Yggdrasil = struct {
     rng_state: u32 = 0,
 
     is_root: bool = false,
+    max_children: usize = 0,
     root: ?RootRoute = null,
     root_seq: u16 = 0,
     root_timeout_ms: u32 = 90_000,
@@ -139,6 +146,7 @@ pub const Yggdrasil = struct {
     join_backoff_ms: u32 = 0,
     lost_root: ?RootRoute = null,
     lost_root_at: u32 = 0,
+    join_candidate: ?JoinCandidate = null,
     report_at: ?u32 = null,
     reported_at: u32 = 0,
     reported_once: bool = false,
@@ -292,12 +300,20 @@ pub const Yggdrasil = struct {
     fn plannedTx(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, from: u32, len: usize) u32 {
         const p = ygg.power orelse return from;
 
-        if (alwaysListening(neighbor) or ygg.lingering(neighbor, from, len)) {
+        if (ygg.lingering(neighbor, from, len)) {
             if (neighbor.tx_at) |t| {
                 if (after(t, from) and !after(t, from +% 2 * p.backoffMs()))
                     return t;
             }
             return from;
+        }
+
+        if (alwaysListening(neighbor)) {
+            if (neighbor.tx_at) |t| {
+                if (after(t, from) and !after(t, from +% 2 * p.backoffMs()))
+                    return t;
+            }
+            return ygg.outsideOwnWindow(from);
         }
 
         var start = power.windowAt(neighbor.next_window, neighbor.period_ms, from);
@@ -310,7 +326,7 @@ pub const Yggdrasil = struct {
         const latest = start +% usable;
 
         if (neighbor.tx_at) |t| {
-            if (reached(t, earliest) and reached(latest, t))
+            if (reached(t, start +% g) and reached(latest, t))
                 return t;
         }
 
@@ -369,7 +385,7 @@ pub const Yggdrasil = struct {
         packet.period = 0;
 
         const p = ygg.power orelse return;
-        if (!p.sleepy() or ygg.joining_until != null)
+        if (!p.sleepy())
             return;
 
         const now = ygg.currentTime();
@@ -441,6 +457,9 @@ pub const Yggdrasil = struct {
 
         if (ygg.pending_announce != null)
             wake.consider(ygg.announce_at);
+
+        if (ygg.next_beacon_at) |t|
+            wake.consider(t);
 
         if (ygg.topology_flooding and ygg.own_flood_pending)
             wake.consider(ygg.own_flood_at);
@@ -522,6 +541,7 @@ pub const Yggdrasil = struct {
         ygg.old_window = ours;
         ygg.old_window_until = now +% @as(u32, p.legacy_periods) * period;
         ygg.own_window = target;
+        ygg.next_beacon_at = null;
     }
 
     fn loseRoot(ygg: *Yggdrasil, now: u32) void {
@@ -530,6 +550,7 @@ pub const Yggdrasil = struct {
         ygg.lost_root_at = now;
         ygg.forwarding_table.removeRoute(current.addr);
         ygg.root = null;
+        ygg.next_beacon_at = null;
         ygg.next_join_at = now +% ygg.joinJitter();
         ygg.join_backoff_ms = 0;
         ygg.recomputeRoutes();
@@ -617,6 +638,8 @@ pub const Yggdrasil = struct {
         if (ygg.joining_until) |until| {
             if (reached(now, until)) {
                 ygg.joining_until = null;
+                if (ygg.adoptCandidate(now))
+                    return false;
                 ygg.finishJoin(now);
                 return false;
             }
@@ -637,6 +660,7 @@ pub const Yggdrasil = struct {
             return false;
 
         ygg.joining_until = now +% p.scanMs();
+        ygg.join_candidate = null;
         ygg.hellos_left = @max(p.join_hellos, 1) - 1;
         ygg.next_hello_at = now +% p.helloSpacingMs() +% ygg.joinJitter();
         try ygg.sayHello();
@@ -645,15 +669,52 @@ pub const Yggdrasil = struct {
 
     fn maintainBeacon(ygg: *Yggdrasil, now: u32) void {
         const p = ygg.power.?;
-        if (!ygg.is_root or p.root_beacon_ms == 0)
+        const ann = ygg.currentAnnouncement() orelse {
+            ygg.next_beacon_at = null;
+            return;
+        };
+
+        if (ygg.is_root and p.root_beacon_ms != 0) {
+            if (ygg.atCapacity())
+                return;
+
+            const due = ygg.next_beacon_at orelse now;
+            if (!reached(now, due) or ygg.pending_announce != null)
+                return;
+
+            ygg.queueAnnouncement(ann, now);
+            ygg.next_beacon_at = now +% p.root_beacon_ms +% ygg.random(p.root_beacon_ms / 4);
+            return;
+        }
+
+        if (!p.sleepy() or p.beacon_periods == 0)
             return;
 
-        const due = ygg.next_beacon_at orelse now;
+        const due = ygg.next_beacon_at orelse blk: {
+            const at = ygg.beaconAt(p, now, p.periodMs());
+            ygg.next_beacon_at = at;
+            break :blk at;
+        };
         if (!reached(now, due) or ygg.pending_announce != null)
             return;
 
-        ygg.queueAnnouncement(.{ .root = ygg.address, .seq = ygg.root_seq, .hops = 0 }, now);
-        ygg.next_beacon_at = now +% p.root_beacon_ms +% ygg.random(p.root_beacon_ms / 4);
+        ygg.queueAnnouncement(ann, now);
+        ygg.next_beacon_at = ygg.beaconAt(p, now, p.beaconIntervalMs());
+    }
+
+    fn beaconAt(ygg: *Yggdrasil, p: Power, now: u32, ahead: u32) u32 {
+        const start = ygg.ownWindowStart(now +% ahead);
+        return start +% p.windowMs() +% ygg.random(p.guard_ms);
+    }
+
+    fn outsideOwnWindow(ygg: *Yggdrasil, at: u32) u32 {
+        const p = ygg.power orelse return at;
+        if (!p.sleepy() or ygg.is_root or !ygg.own_window_set)
+            return at;
+        const start = ygg.ownWindowStart(at);
+        if (at -% start < p.windowMs())
+            return start +% p.windowMs();
+        return at;
     }
 
     fn finishJoin(ygg: *Yggdrasil, now: u32) void {
@@ -1022,18 +1083,26 @@ pub const Yggdrasil = struct {
         }
     }
 
+    pub fn atCapacity(ygg: *const Yggdrasil) bool {
+        return ygg.is_root and ygg.max_children != 0 and
+            ygg.forwarding_table.num_registered_output_map >= ygg.max_children;
+    }
+
     pub fn learnNeighbor(ygg: *Yggdrasil, addr: u16) NeighborError!*routing.MessageQueueMap {
         const ft = &ygg.forwarding_table;
 
         if (ft.neighborByAddr(addr)) |existing|
             return existing;
 
+        if (ygg.atCapacity())
+            return error.AtCapacity;
+
         const slot = ft.freeSlot() orelse return error.TooManyNeighbors;
         return ygg.registerNeighbor(addr, slot);
     }
 
     pub fn send(ygg: *Yggdrasil, dest: u16, payload: []const u8, priority: u8) SendError!void {
-        const found = ygg.forwarding_table.route(dest) orelse return error.NoRoute;
+        const found = ygg.routeTo(dest) orelse return error.NoRoute;
 
         var packet = NetworkPacket{
             .from = ygg.address,
@@ -1045,6 +1114,16 @@ pub const Yggdrasil = struct {
         try packet.setPayload(payload);
 
         try ygg.outgoing_packets.pushMessage(found.neighbor.mq_idx, packet, priority);
+    }
+
+    fn routeTo(ygg: *Yggdrasil, dest: u16) ?routing.Route {
+        if (ygg.root) |current| {
+            if (current.addr == dest and current.via != dest) {
+                if (ygg.forwarding_table.neighborByAddr(current.via)) |via|
+                    return .{ .neighbor = via, .hops = current.hops };
+            }
+        }
+        return ygg.forwarding_table.route(dest);
     }
 
     pub fn rootAddress(ygg: *const Yggdrasil) ?u16 {
@@ -1126,9 +1205,11 @@ pub const Yggdrasil = struct {
                 return;
             if (ygg.root == null and !ygg.feasible(ann, now))
                 return;
+            if (ygg.root == null and ygg.joining_until != null and hops > 1) {
+                ygg.considerCandidate(ann, from, hops);
+                return;
+            }
         }
-
-        const previous = ygg.root;
 
         if (ygg.root) |*current| {
             if (current.addr == ann.root) {
@@ -1148,7 +1229,39 @@ pub const Yggdrasil = struct {
             }
         }
 
-        ygg.forwarding_table.setRoute(ann.root, neighbor.mq_idx, hops) catch return;
+        ygg.adoptRoot(ann, neighbor, hops, now);
+    }
+
+    fn betterRoot(best: JoinCandidate, ann: AppPacket.RootAnnouncement, hops: u8) bool {
+        if (best.ann.root != ann.root)
+            return hops < best.hops;
+        if (routing.seqNewer(ann.seq, best.ann.seq))
+            return true;
+        return ann.seq == best.ann.seq and hops < best.hops;
+    }
+
+    fn considerCandidate(ygg: *Yggdrasil, ann: AppPacket.RootAnnouncement, via: u16, hops: u8) void {
+        if (ygg.join_candidate) |best| {
+            if (!betterRoot(best, ann, hops))
+                return;
+        }
+        ygg.join_candidate = .{ .ann = ann, .via = via, .hops = hops };
+    }
+
+    fn adoptCandidate(ygg: *Yggdrasil, now: u32) bool {
+        const candidate = ygg.join_candidate orelse return false;
+        ygg.join_candidate = null;
+
+        const neighbor = ygg.forwarding_table.neighborByAddr(candidate.via) orelse return false;
+        ygg.adoptRoot(candidate.ann, neighbor, candidate.hops, now);
+        return ygg.root != null;
+    }
+
+    fn adoptRoot(ygg: *Yggdrasil, ann: AppPacket.RootAnnouncement, via: *routing.MessageQueueMap, hops: u8, now: u32) void {
+        const previous = ygg.root;
+        const from = via.addr;
+
+        ygg.forwarding_table.setRoute(ann.root, via.mq_idx, hops) catch return;
         ygg.root = .{
             .addr = ann.root,
             .via = from,
@@ -1164,9 +1277,12 @@ pub const Yggdrasil = struct {
             );
         } else {
             const changed = if (previous) |prev| prev.addr != ann.root or prev.seq != ann.seq else true;
-            if (changed)
+            if (changed) {
                 ygg.markAnnounce(from, hops);
+                ygg.next_beacon_at = null;
+            }
             ygg.joining_until = null;
+            ygg.join_candidate = null;
             ygg.hellos_left = 0;
             ygg.join_backoff_ms = 0;
             ygg.ever_rooted = true;
@@ -1253,7 +1369,8 @@ pub const Yggdrasil = struct {
         if (packet.ttl <= 1)
             return;
 
-        const hop = ygg.forwarding_table.nextHop(packet.dest) orelse return;
+        const found = ygg.routeTo(packet.dest) orelse return;
+        const hop = found.neighbor;
 
         if (hop.addr == packet.from)
             return;
@@ -1304,8 +1421,12 @@ pub const Yggdrasil = struct {
         if (packet.to != ygg.address)
             return;
 
-        if (packet.from != ygg.address)
-            _ = ygg.learnNeighbor(packet.from) catch {};
+        if (packet.from != ygg.address) {
+            _ = ygg.learnNeighbor(packet.from) catch |err| switch (err) {
+                error.AtCapacity => return,
+                else => {},
+            };
+        }
 
         if (ygg.forwarding_table.neighborByAddr(packet.from)) |neighbor| {
             if (ygg.power != null and isHello(&packet))
@@ -2040,6 +2161,381 @@ test "root routes expire without fresh announcements" {
     try std.testing.expect(b.rootAddress() == null);
     try std.testing.expect(b.forwarding_table.forwarding_table[0..b.forwarding_table.num_forwards].len == 0);
     try std.testing.expectError(error.NoRoute, b.sendToRoot("x", MessageQueue.PRIORITY_LOW));
+}
+
+test "a planned send stays due when the loop polls late in the window" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(1);
+    a.power = .{ .period_ms = 10_000, .radio = .{ .spreading_factor = 7 } };
+    const neighbor = try a.registerNeighbor(2, 0);
+    neighbor.sched_known = true;
+    neighbor.period_ms = 10_000;
+    neighbor.next_window = 1000;
+
+    const len: usize = 30;
+    const t = a.plannedTx(neighbor, 1000, len);
+    try std.testing.expect(Yggdrasil.after(t, 1000));
+    try std.testing.expectEqual(t, a.plannedTx(neighbor, t + 5, len));
+    try std.testing.expect(a.sendable(neighbor, t + 5, len));
+}
+
+test "joiners keep the shortest root offered during a scan" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(10);
+    var b = TestClock.node(20);
+    var c = TestClock.node(30);
+    c.power = .{ .period_ms = 1000 };
+    c.joining_until = 5000;
+
+    announcementFrom(&a, 1, 5, 2);
+    try TestNet.transmit(&a, &.{&c});
+    try std.testing.expect(c.root == null);
+
+    announcementFrom(&b, 1, 5, 1);
+    try TestNet.transmit(&b, &.{&c});
+
+    announcementFrom(&a, 1, 5, 3);
+    try TestNet.transmit(&a, &.{&c});
+    try std.testing.expect(c.root == null);
+
+    TestClock.time = 5000;
+    _ = try c.requestWrite();
+    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
+    try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
+    try std.testing.expect(c.joining_until == null);
+    try std.testing.expect(c.join_candidate == null);
+}
+
+test "joiners adopt a direct root without waiting for the scan to end" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(1);
+    var c = TestClock.node(30);
+    c.power = .{ .period_ms = 1000 };
+    c.joining_until = 5000;
+
+    announcementFrom(&a, 1, 5, 0);
+    try TestNet.transmit(&a, &.{&c});
+    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(u8, 1), c.root.?.hops);
+    try std.testing.expect(c.joining_until == null);
+}
+
+test "joiners advertise their wake schedule while scanning" {
+    TestClock.time = 0;
+
+    var b = TestClock.node(2);
+    var c = TestClock.node(3);
+    b.power = .{ .period_ms = 1000 };
+    c.power = .{ .period_ms = 1000 };
+    c.joining_until = 5000;
+
+    try c.sayHello();
+    try TestNet.hear(&b);
+
+    const joiner = b.forwarding_table.neighborByAddr(3).?;
+    try std.testing.expectEqual(@as(u32, 1000), joiner.period_ms);
+    try std.testing.expect(!Yggdrasil.alwaysListening(joiner));
+}
+
+test "sleepy nodes hold sends to always-on neighbors until their own window closes" {
+    TestClock.time = 0;
+
+    var n = TestClock.node(2);
+    n.power = .{ .period_ms = 60_000, .radio = .{ .spreading_factor = 7 } };
+    n.own_window = 1000;
+    n.own_window_set = true;
+    const root = try n.registerNeighbor(1, 0);
+    const p = n.power.?;
+
+    try std.testing.expectEqual(@as(u32, 1000 + p.windowMs()), n.plannedTx(root, 1100, 20));
+    try std.testing.expectEqual(@as(u32, 500), n.plannedTx(root, 500, 20));
+    try std.testing.expectEqual(@as(u32, 1000 + p.windowMs() + 5), n.plannedTx(root, 1000 + p.windowMs() + 5, 20));
+}
+
+test "rooted sleepy nodes beacon right after their own window every few periods" {
+    TestClock.time = 0;
+
+    var a = TestClock.node(1);
+    var b = TestClock.node(2);
+    b.power = .{ .period_ms = 1000, .beacon_periods = 2, .radio = .{ .spreading_factor = 7 } };
+
+    announcementFrom(&a, 1, 5, 0);
+    try TestNet.transmit(&a, &.{&b});
+    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+
+    const p = b.power.?;
+    var beacons: usize = 0;
+    while (TestClock.time < 20_000) : (TestClock.time += 5) {
+        if (b.idleFor() != 0) continue;
+        while (try b.requestWrite()) {
+            var probe = TestNet.node(99);
+            TestNet.delivered = null;
+            try TestNet.hear(&probe);
+            const got = TestNet.delivered orelse continue;
+            if (!got.broadcast or AppPacket.parse(got.body()).?.op != .im_a_root) continue;
+
+            beacons += 1;
+            const now = TestClock.time;
+            const since = now -% b.ownWindowStart(now -% p.windowMs());
+            try std.testing.expect(since >= p.windowMs() and since <= p.windowMs() + p.guard_ms + 5);
+            try std.testing.expectEqual(@as(u8, 1), got.hops);
+        }
+    }
+
+    try std.testing.expect(beacons >= 9 and beacons <= 10);
+}
+
+const Air = struct {
+    const Frame = struct {
+        bytes: [TX_BUFFER_SIZE]u8,
+        len: usize,
+        from: u16,
+        at: u32,
+    };
+
+    nodes: []const *Yggdrasil,
+    links: []const [2]u16,
+    sample_ms: u32 = 0,
+    frames: [64]Frame = undefined,
+    num_frames: usize = 0,
+
+    fn hears(air: *const Air, a: u16, b: u16) bool {
+        for (air.links) |l| {
+            if ((l[0] == a and l[1] == b) or (l[0] == b and l[1] == a)) return true;
+        }
+        return false;
+    }
+
+    fn deliver(ygg: *Yggdrasil, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (ygg.readByte(byte)) |packet| ygg.handle_network_packet(packet);
+        }
+    }
+
+    fn step(air: *Air) !void {
+        const now = TestClock.time;
+
+        var i: usize = 0;
+        while (i < air.num_frames) {
+            const frame = air.frames[i];
+            if (!Yggdrasil.reached(now, frame.at)) {
+                i += 1;
+                continue;
+            }
+            for (air.nodes) |n| {
+                if (n.address != frame.from and air.hears(frame.from, n.address) and n.idleFor() == 0)
+                    deliver(n, frame.bytes[0..frame.len]);
+            }
+            air.num_frames -= 1;
+            air.frames[i] = air.frames[air.num_frames];
+        }
+
+        if (air.sample_ms != 0) {
+            for (air.nodes) |n| {
+                if (n.is_root or (now +% @as(u32, n.address) * 7910) % air.sample_ms != 0) continue;
+                n.sendToRoot("s", MessageQueue.PRIORITY_LOW) catch {};
+            }
+        }
+
+        for (air.nodes) |n| {
+            if (n.idleFor() != 0) continue;
+            for (0..4) |_| {
+                if (!try n.requestWrite()) break;
+                if (air.num_frames >= air.frames.len) return error.AirFull;
+                const airtime = if (n.power) |p| p.frameMs(TestNet.wire_len) else 0;
+                const frame = &air.frames[air.num_frames];
+                @memcpy(frame.bytes[0..TestNet.wire_len], TestNet.wire[0..TestNet.wire_len]);
+                frame.len = TestNet.wire_len;
+                frame.from = n.address;
+                frame.at = now +% airtime;
+                air.num_frames += 1;
+            }
+        }
+    }
+
+    fn runUntil(air: *Air, limit_ms: u32, done: *const fn () bool) !bool {
+        while (TestClock.time < limit_ms) : (TestClock.time += 10) {
+            try air.step();
+            if (done()) return true;
+        }
+        return false;
+    }
+};
+
+fn sleepyNode(addr: u16, period_ms: u32) Yggdrasil {
+    var ygg = TestClock.node(addr);
+    ygg.retransmit_timeout_ms = 3000;
+    ygg.retransmit_jitter_ms = 1000;
+    ygg.max_retries = 10;
+    ygg.root_timeout_ms = 6 * period_ms;
+    ygg.power = .{
+        .period_ms = period_ms,
+        .neighbor_timeout_ms = 30 * period_ms,
+        .radio = .{ .spreading_factor = 7 },
+    };
+    return ygg;
+}
+
+const ChainRoot = struct {
+    var got_from_far: bool = false;
+    var far_addr: u16 = 3;
+
+    fn cb(packet: NetworkPacket) void {
+        if (packet.origin == far_addr and packet.dest == 1 and std.mem.eql(u8, packet.body(), "far"))
+            got_from_far = true;
+    }
+};
+
+var chain_far: *Yggdrasil = undefined;
+var chain_relay: *Yggdrasil = undefined;
+
+fn chainJoined() bool {
+    return chain_far.rootAddress() != null;
+}
+
+fn relayJoined() bool {
+    return chain_relay.rootAddress() != null;
+}
+
+fn never() bool {
+    return false;
+}
+
+fn chainDelivered() bool {
+    return ChainRoot.got_from_far;
+}
+
+test "sleepy nodes join through a sleepy relay out of range of the root" {
+    TestClock.time = 0;
+    TestClock.lost = null;
+    ChainRoot.got_from_far = false;
+    ChainRoot.far_addr = 3;
+
+    var root = TestClock.node(1);
+    root.is_root = true;
+    root.result_cb = ChainRoot.cb;
+    root.power = .{ .period_ms = 0, .radio = .{ .spreading_factor = 7 } };
+
+    var relay = sleepyNode(2, 60_000);
+    var far = sleepyNode(3, 60_000);
+    chain_relay = &relay;
+    chain_far = &far;
+
+    var air = Air{
+        .nodes = &.{ &root, &relay },
+        .links = &.{ .{ 1, 2 }, .{ 2, 3 } },
+        .sample_ms = 60_000,
+    };
+
+    try std.testing.expect(try air.runUntil(5 * 60_000, relayJoined));
+    _ = try air.runUntil(TestClock.time + 10 * 60_000, never);
+    try std.testing.expectEqual(@as(?u16, 1), relay.rootAddress());
+
+    air.nodes = &.{ &root, &relay, &far };
+    try std.testing.expect(try air.runUntil(TestClock.time + 20 * 60_000, chainJoined));
+    try std.testing.expectEqual(@as(?u16, 1), relay.rootAddress());
+    try std.testing.expectEqual(@as(u8, 2), far.root.?.hops);
+    try std.testing.expectEqual(@as(u16, 2), far.root.?.via);
+
+    try far.sendToRoot("far", MessageQueue.PRIORITY_LOW);
+    try std.testing.expect(try air.runUntil(TestClock.time + 5 * 60_000, chainDelivered));
+}
+
+var room_a: *Yggdrasil = undefined;
+var room_b: *Yggdrasil = undefined;
+
+fn roomJoined() bool {
+    return room_a.rootAddress() != null and room_b.rootAddress() != null;
+}
+
+test "a full root refuses new children so they hop through an existing one" {
+    TestClock.time = 0;
+    TestClock.lost = null;
+    ChainRoot.got_from_far = false;
+
+    var root = TestClock.node(1);
+    root.is_root = true;
+    root.max_children = 1;
+    root.result_cb = ChainRoot.cb;
+    root.power = .{ .period_ms = 0, .root_beacon_ms = 20_000, .radio = .{ .spreading_factor = 7 } };
+
+    var a = sleepyNode(2, 60_000);
+    var b = sleepyNode(3, 60_000);
+    room_a = &a;
+    room_b = &b;
+
+    var air = Air{
+        .nodes = &.{ &root, &a, &b },
+        .links = &.{ .{ 1, 2 }, .{ 1, 3 }, .{ 2, 3 } },
+        .sample_ms = 60_000,
+    };
+
+    try std.testing.expect(try air.runUntil(30 * 60_000, roomJoined));
+    _ = try air.runUntil(TestClock.time + 10 * 60_000, never);
+
+    try std.testing.expectEqual(@as(usize, 1), root.forwarding_table.num_registered_output_map);
+    try std.testing.expect(root.atCapacity());
+
+    const near, const far = if (a.root.?.hops == 1) .{ &a, &b } else .{ &b, &a };
+    try std.testing.expectEqual(@as(u8, 1), near.root.?.hops);
+    try std.testing.expectEqual(@as(u8, 2), far.root.?.hops);
+    try std.testing.expectEqual(near.address, far.root.?.via);
+    try std.testing.expect(root.forwarding_table.neighborByAddr(near.address) != null);
+
+    ChainRoot.far_addr = far.address;
+    try far.sendToRoot("far", MessageQueue.PRIORITY_LOW);
+    try std.testing.expect(try air.runUntil(TestClock.time + 5 * 60_000, chainDelivered));
+}
+
+test "traffic to the root follows the adopted parent over an overheard direct root" {
+    TestClock.time = 0;
+
+    var n = TestClock.node(3);
+    const parent = try n.registerNeighbor(2, 0);
+    n.root = .{ .addr = 1, .via = 2, .hops = 2, .seq = 1, .heard_at = 0 };
+    try n.forwarding_table.setRoute(1, parent.mq_idx, 2);
+    _ = try n.registerNeighbor(1, 1);
+
+    try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
+    try std.testing.expectEqual(@as(u16, 2), n.outgoing_packets.txBuffer(parent.mq_idx).?.to);
+    try std.testing.expect(n.outgoing_packets.txBuffer(1) == null);
+}
+
+test "a full root ignores hellos and direct frames from new nodes" {
+    TestClock.time = 0;
+
+    var root = TestClock.node(1);
+    root.is_root = true;
+    root.max_children = 1;
+    root.power = .{ .period_ms = 0 };
+    var a = TestClock.node(2);
+    var b = TestClock.node(3);
+
+    try a.sayHello();
+    try TestNet.hear(&root);
+    try std.testing.expect(root.forwarding_table.neighborByAddr(2) != null);
+    try std.testing.expect(root.atCapacity());
+
+    try b.sayHello();
+    try TestNet.hear(&root);
+    try std.testing.expect(root.forwarding_table.neighborByAddr(3) == null);
+
+    _ = try b.registerNeighbor(1, 0);
+    try b.send(1, "x", MessageQueue.PRIORITY_LOW);
+    TestNet.delivered = null;
+    try TestNet.transmit(&b, &.{&root});
+    try std.testing.expect(TestNet.delivered == null);
+    try std.testing.expect(root.forwarding_table.neighborByAddr(3) == null);
+
+    root.dropNeighbor(2);
+    try std.testing.expect(!root.atCapacity());
+    try b.sayHello();
+    try TestNet.hear(&root);
+    try std.testing.expect(root.forwarding_table.neighborByAddr(3) != null);
 }
 
 test {

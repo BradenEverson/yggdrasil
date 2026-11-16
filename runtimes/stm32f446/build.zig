@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     node_config.addOption(u3, "cr", b.option(u3, "cr", "LoRa coding rate 1-4, must match the whole network") orelse 1);
     node_config.addOption(u8, "preamble", b.option(u8, "preamble", "LoRa programmed preamble 4-7") orelse 4);
     node_config.addOption(u4, "tx_power", b.option(u4, "tx_power", "RF output power in dBm 0-15") orelse 15);
+    node_config.addOption(u8, "beacon_periods", b.option(u8, "beacon_periods", "Periods between root beacons from joined nodes, also sets the join scan length, must match the whole network") orelse 3);
     node_config.addOption(u32, "radio_wake_ms", b.option(u32, "radio_wake_ms", "Lead time to wake the radio before a window") orelse 250);
     node_config.addOption(bool, "log", b.option(bool, "log", "Print debug output on USART2") orelse true);
     node_config.addOption(bool, "radio_sleep", b.option(bool, "radio_sleep", "Put the radio and MCU to sleep between windows") orelse true);
@@ -57,4 +58,24 @@ pub fn build(b: *std.Build) void {
 
     const install_bin = b.addInstallFile(bin_file, "yggdrasil.bin");
     b.getInstallStep().dependOn(&install_bin.step);
+
+    const programmer: std.Build.LazyPath = if (b.option([]const u8, "programmer", "Path to STM32_Programmer_CLI")) |path|
+        .{ .cwd_relative = path }
+    else
+        b.findProgramLazy(.{ .names = &.{
+            "STM32_Programmer_CLI",
+            b.pathJoin(&.{ b.graph.environ_map.get("HOME") orelse "/root", "STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI" }),
+            "/opt/st/stm32cubeprogrammer/bin/STM32_Programmer_CLI",
+        } });
+
+    const flash_cmd = std.Build.Step.Run.create(b, "flash");
+    flash_cmd.addFileArg(programmer);
+    flash_cmd.addArgs(&.{ "-c", b.fmt("port={s}", .{b.option([]const u8, "port", "Programmer port, e.g. SWD or /dev/ttyACM0") orelse "SWD"}), "-w" });
+    flash_cmd.addFileArg(bin_file);
+    flash_cmd.addArgs(&.{ "0x08000000", "-v", "-rst" });
+    flash_cmd.has_side_effects = true;
+    flash_cmd.step.dependOn(&install_bin.step);
+
+    const flash_step = b.step("flash", "Build and flash with STM32_Programmer_CLI");
+    flash_step.dependOn(&flash_cmd.step);
 }

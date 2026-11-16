@@ -20,6 +20,7 @@ pub const Power = struct {
     join_backoff_fresh_max_ms: u32 = 5 * 60_000,
     join_hellos: u8 = 3,
     root_beacon_ms: u32 = 0,
+    beacon_periods: u8 = 3,
     report_holddown_ms: u32 = 10_000,
     report_refresh_ms: u32 = 60 * 60_000,
     neighbor_timeout_ms: u32 = 0,
@@ -60,7 +61,11 @@ pub const Power = struct {
 
     pub fn scanMs(p: Power) u32 {
         if (!p.sleepy()) return 4 * p.windowMs();
-        return p.periodMs() + p.windowMs() + p.lingerMs(p.frame_budget);
+        return @as(u32, @max(p.beacon_periods, 1)) * p.periodMs() + p.windowMs() + p.lingerMs(p.frame_budget);
+    }
+
+    pub fn beaconIntervalMs(p: Power) u32 {
+        return @as(u32, p.beacon_periods) * p.periodMs();
     }
 
     pub fn helloSpacingMs(p: Power) u32 {

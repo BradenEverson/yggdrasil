@@ -20,6 +20,7 @@ RADIO_CHECK_PERIOD_S = 60.0
 WS_CONNECT_TIMEOUT_S = 3.0
 WS_RECONNECT_PERIOD_S = 10.0
 ROOT_BEACON_MS = 20_000
+MAX_CHILDREN = 0
 
 BANDWIDTH_CODES = {
     7800: 0,
@@ -156,7 +157,7 @@ def describe_frame(frame):
 
 
 class Hub(object):
-    def __init__(self, radio, log, stream, address, sf, bandwidth_hz, coding_rate, preamble, tx_power, trace=False):
+    def __init__(self, radio, log, stream, address, sf, bandwidth_hz, coding_rate, preamble, tx_power, trace=False, max_children=MAX_CHILDREN):
         self.trace = trace
         self.radio = radio
         self.stream = stream
@@ -176,6 +177,7 @@ class Hub(object):
         self.node.configure_power(0, sf, bandwidth_hz, coding_rate, preamble)
         self.node.set_root_seq(int(time.time() // 60))
         self.node.set_root_beacon(ROOT_BEACON_MS)
+        self.node.set_max_children(max_children)
 
     def check_radio(self):
         resets = self.radio.resets
@@ -295,6 +297,7 @@ def main():
     parser.add_argument("--preamble", type=int, default=4, choices=[4, 5, 6, 7], help="LoRa programmed preamble")
     parser.add_argument("--power", type=int, default=15, choices=range(16), help="RF output power in dBm")
     parser.add_argument("--trace", action="store_true", help="Print every frame sent and received")
+    parser.add_argument("--max-children", type=int, default=MAX_CHILDREN, help="Maximum direct children before new nodes are refused and must hop through another node (0 = unlimited)")
     args = parser.parse_args()
 
     print("Jetson Nano Hub!")
@@ -320,7 +323,7 @@ def main():
         radio.send_command("AT+NETWORKID?")
         radio.send_command("AT+PARAMETER?")
 
-        hub = Hub(radio, log, stream, args.address, args.sf, args.bw, args.cr, args.preamble, args.power, trace=args.trace)
+        hub = Hub(radio, log, stream, args.address, args.sf, args.bw, args.cr, args.preamble, args.power, trace=args.trace, max_children=args.max_children)
         radio.on_receive = hub.on_radio
         hub.run()
 

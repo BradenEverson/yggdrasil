@@ -95,6 +95,10 @@ export fn ygg_set_root_beacon(period_ms: u32) void {
     if (node.power) |*p| p.root_beacon_ms = period_ms;
 }
 
+export fn ygg_set_max_children(max_children: u32) void {
+    if (initialized) node.max_children = max_children;
+}
+
 export fn ygg_set_root_seq(seq: u16) void {
     if (initialized) node.root_seq = seq;
 }
