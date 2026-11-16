@@ -18,6 +18,7 @@ inbox_dropped: u32 = 0,
 
 params: ?Parameters = null,
 power_dbm: ?u4 = null,
+last_wake: WakeTiming = .{},
 
 received: u32 = 0,
 last_rx: [FRAME_PEEK]u8 = undefined,
@@ -79,6 +80,13 @@ pub const Bandwidth = enum(u4) {
     }
 };
 
+pub const WakeTiming = struct {
+    attempts: u32 = 0,
+    at_ms: u32 = 0,
+    params_ms: u32 = 0,
+    power_ms: u32 = 0,
+};
+
 pub const Parameters = struct {
     spreading_factor: u4 = 9,
     bandwidth: Bandwidth = .khz125,
@@ -101,6 +109,11 @@ pub fn poll(self: *Self) void {
         const byte = hal.uart.tryReadByte(self.uart) orelse break;
         _ = self.feed(byte);
     }
+}
+
+pub fn pending(self: *Self) bool {
+    self.poll();
+    return self.inbox_head != self.inbox_tail;
 }
 
 pub fn read(self: *Self, buf: []u8) []u8 {
@@ -244,11 +257,16 @@ pub fn wake(self: *Self) RylrError!void {
     self.line_state = .text;
     self.line_len = 0;
 
+    self.last_wake = .{};
+    const start = hal.timer.millis();
+
     var attempt: u32 = 0;
     while (attempt < WAKE_ATTEMPTS) : (attempt += 1) {
+        self.last_wake.attempts = attempt + 1;
         self.line_len = 0;
         hal.uart.writeStr(self.uart, "AT\r\n");
         self.awaitReply(WAKE_TIMEOUT_MS, true) catch continue;
+        self.last_wake.at_ms = hal.timer.millis() -% start;
         self.line_len = 0;
         self.restore() catch continue;
         return;
@@ -258,8 +276,20 @@ pub fn wake(self: *Self) RylrError!void {
 }
 
 fn restore(self: *Self) RylrError!void {
-    if (self.params) |params| try self.setParameters(params);
-    if (self.power_dbm) |dbm| try self.setPower(dbm);
+    self.last_wake.params_ms = 0;
+    self.last_wake.power_ms = 0;
+
+    if (self.params) |params| {
+        const start = hal.timer.millis();
+        try self.setParameters(params);
+        self.last_wake.params_ms = hal.timer.millis() -% start;
+    }
+
+    if (self.power_dbm) |dbm| {
+        const start = hal.timer.millis();
+        try self.setPower(dbm);
+        self.last_wake.power_ms = hal.timer.millis() -% start;
+    }
 }
 
 pub fn setParameters(self: *Self, params: Parameters) RylrError!void {

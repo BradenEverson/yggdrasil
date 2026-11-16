@@ -300,12 +300,20 @@ pub const Yggdrasil = struct {
     fn plannedTx(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, from: u32, len: usize) u32 {
         const p = ygg.power orelse return from;
 
-        if (alwaysListening(neighbor) or ygg.lingering(neighbor, from, len)) {
+        if (ygg.lingering(neighbor, from, len)) {
             if (neighbor.tx_at) |t| {
                 if (after(t, from) and !after(t, from +% 2 * p.backoffMs()))
                     return t;
             }
             return from;
+        }
+
+        if (alwaysListening(neighbor)) {
+            if (neighbor.tx_at) |t| {
+                if (after(t, from) and !after(t, from +% 2 * p.backoffMs()))
+                    return t;
+            }
+            return ygg.outsideOwnWindow(from);
         }
 
         var start = power.windowAt(neighbor.next_window, neighbor.period_ms, from);
@@ -696,7 +704,17 @@ pub const Yggdrasil = struct {
 
     fn beaconAt(ygg: *Yggdrasil, p: Power, now: u32, ahead: u32) u32 {
         const start = ygg.ownWindowStart(now +% ahead);
-        return start +% p.guard_ms +% ygg.random(p.backoffMs());
+        return start +% p.windowMs() +% ygg.random(p.guard_ms);
+    }
+
+    fn outsideOwnWindow(ygg: *Yggdrasil, at: u32) u32 {
+        const p = ygg.power orelse return at;
+        if (!p.sleepy() or ygg.is_root or !ygg.own_window_set)
+            return at;
+        const start = ygg.ownWindowStart(at);
+        if (at -% start < p.windowMs())
+            return start +% p.windowMs();
+        return at;
     }
 
     fn finishJoin(ygg: *Yggdrasil, now: u32) void {
@@ -1084,7 +1102,7 @@ pub const Yggdrasil = struct {
     }
 
     pub fn send(ygg: *Yggdrasil, dest: u16, payload: []const u8, priority: u8) SendError!void {
-        const found = ygg.forwarding_table.route(dest) orelse return error.NoRoute;
+        const found = ygg.routeTo(dest) orelse return error.NoRoute;
 
         var packet = NetworkPacket{
             .from = ygg.address,
@@ -1096,6 +1114,16 @@ pub const Yggdrasil = struct {
         try packet.setPayload(payload);
 
         try ygg.outgoing_packets.pushMessage(found.neighbor.mq_idx, packet, priority);
+    }
+
+    fn routeTo(ygg: *Yggdrasil, dest: u16) ?routing.Route {
+        if (ygg.root) |current| {
+            if (current.addr == dest and current.via != dest) {
+                if (ygg.forwarding_table.neighborByAddr(current.via)) |via|
+                    return .{ .neighbor = via, .hops = current.hops };
+            }
+        }
+        return ygg.forwarding_table.route(dest);
     }
 
     pub fn rootAddress(ygg: *const Yggdrasil) ?u16 {
@@ -1341,7 +1369,8 @@ pub const Yggdrasil = struct {
         if (packet.ttl <= 1)
             return;
 
-        const hop = ygg.forwarding_table.nextHop(packet.dest) orelse return;
+        const found = ygg.routeTo(packet.dest) orelse return;
+        const hop = found.neighbor;
 
         if (hop.addr == packet.from)
             return;
@@ -2212,7 +2241,22 @@ test "joiners advertise their wake schedule while scanning" {
     try std.testing.expect(!Yggdrasil.alwaysListening(joiner));
 }
 
-test "rooted sleepy nodes beacon inside their own window every few periods" {
+test "sleepy nodes hold sends to always-on neighbors until their own window closes" {
+    TestClock.time = 0;
+
+    var n = TestClock.node(2);
+    n.power = .{ .period_ms = 60_000, .radio = .{ .spreading_factor = 7 } };
+    n.own_window = 1000;
+    n.own_window_set = true;
+    const root = try n.registerNeighbor(1, 0);
+    const p = n.power.?;
+
+    try std.testing.expectEqual(@as(u32, 1000 + p.windowMs()), n.plannedTx(root, 1100, 20));
+    try std.testing.expectEqual(@as(u32, 500), n.plannedTx(root, 500, 20));
+    try std.testing.expectEqual(@as(u32, 1000 + p.windowMs() + 5), n.plannedTx(root, 1000 + p.windowMs() + 5, 20));
+}
+
+test "rooted sleepy nodes beacon right after their own window every few periods" {
     TestClock.time = 0;
 
     var a = TestClock.node(1);
@@ -2236,7 +2280,8 @@ test "rooted sleepy nodes beacon inside their own window every few periods" {
 
             beacons += 1;
             const now = TestClock.time;
-            try std.testing.expect(now -% b.ownWindowStart(now) < p.windowMs());
+            const since = now -% b.ownWindowStart(now -% p.windowMs());
+            try std.testing.expect(since >= p.windowMs() and since <= p.windowMs() + p.guard_ms + 5);
             try std.testing.expectEqual(@as(u8, 1), got.hops);
         }
     }
@@ -2444,6 +2489,20 @@ test "a full root refuses new children so they hop through an existing one" {
     ChainRoot.far_addr = far.address;
     try far.sendToRoot("far", MessageQueue.PRIORITY_LOW);
     try std.testing.expect(try air.runUntil(TestClock.time + 5 * 60_000, chainDelivered));
+}
+
+test "traffic to the root follows the adopted parent over an overheard direct root" {
+    TestClock.time = 0;
+
+    var n = TestClock.node(3);
+    const parent = try n.registerNeighbor(2, 0);
+    n.root = .{ .addr = 1, .via = 2, .hops = 2, .seq = 1, .heard_at = 0 };
+    try n.forwarding_table.setRoute(1, parent.mq_idx, 2);
+    _ = try n.registerNeighbor(1, 1);
+
+    try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
+    try std.testing.expectEqual(@as(u16, 2), n.outgoing_packets.txBuffer(parent.mq_idx).?.to);
+    try std.testing.expect(n.outgoing_packets.txBuffer(1) == null);
 }
 
 test "a full root ignores hellos and direct frames from new nodes" {

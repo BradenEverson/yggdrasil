@@ -157,7 +157,6 @@ fn sleepRadio() void {
     radio_awake = false;
 }
 
-var wake_reported = false;
 var seen_frames: u32 = 0;
 
 fn wakeRadio() void {
@@ -171,9 +170,14 @@ fn wakeRadio() void {
     };
     radio_awake = true;
     const took = hal.timer.millis() -% start;
-    if (!wake_reported or took > POWER.radio_wake_ms) {
-        wake_reported = true;
-        log("radio wake took {} ms\r\n", .{took});
+    log("radio wake took {} ms\r\n", .{took});
+}
+
+fn serviceRadio() void {
+    ygg.readStream() catch |e| log("read failed: {s}\r\n", .{@errorName(e)});
+    if (lora.received != seen_frames) {
+        seen_frames = lora.received;
+        traceFrame("rx", lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)]);
     }
 }
 
@@ -269,11 +273,7 @@ fn app() void {
         if (ygg.idleFor() == 0) {
             wakeRadio();
 
-            ygg.readStream() catch |e| log("read failed: {s}\r\n", .{@errorName(e)});
-            if (lora.received != seen_frames) {
-                seen_frames = lora.received;
-                traceFrame("rx", lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)]);
-            }
+            serviceRadio();
 
             var writes: usize = 0;
             while (writes < MAX_WRITES_PER_PASS) : (writes += 1) {
@@ -294,11 +294,21 @@ fn app() void {
             continue;
         }
 
-        ygg.readStream() catch {};
-        sleepRadio();
+        serviceRadio();
 
         const idle = ygg.idleFor();
         if (idle == 0) continue;
+
+        if (radio_awake and idle < POWER.radio_wake_ms) {
+            hal.lowpower.idle();
+            continue;
+        }
+
+        sleepRadio();
+        if (lora.pending()) {
+            serviceRadio();
+            continue;
+        }
 
         if (!node_config.radio_sleep) {
             hal.lowpower.idle();

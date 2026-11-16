@@ -58,4 +58,24 @@ pub fn build(b: *std.Build) void {
 
     const install_bin = b.addInstallFile(bin_file, "yggdrasil.bin");
     b.getInstallStep().dependOn(&install_bin.step);
+
+    const programmer: std.Build.LazyPath = if (b.option([]const u8, "programmer", "Path to STM32_Programmer_CLI")) |path|
+        .{ .cwd_relative = path }
+    else
+        b.findProgramLazy(.{ .names = &.{
+            "STM32_Programmer_CLI",
+            b.pathJoin(&.{ b.graph.environ_map.get("HOME") orelse "/root", "STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI" }),
+            "/opt/st/stm32cubeprogrammer/bin/STM32_Programmer_CLI",
+        } });
+
+    const flash_cmd = std.Build.Step.Run.create(b, "flash");
+    flash_cmd.addFileArg(programmer);
+    flash_cmd.addArgs(&.{ "-c", b.fmt("port={s}", .{b.option([]const u8, "port", "Programmer port, e.g. SWD or /dev/ttyACM0") orelse "SWD"}), "-w" });
+    flash_cmd.addFileArg(bin_file);
+    flash_cmd.addArgs(&.{ "0x08000000", "-v", "-rst" });
+    flash_cmd.has_side_effects = true;
+    flash_cmd.step.dependOn(&install_bin.step);
+
+    const flash_step = b.step("flash", "Build and flash with STM32_Programmer_CLI");
+    flash_step.dependOn(&flash_cmd.step);
 }
