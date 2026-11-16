@@ -94,8 +94,8 @@ pub const Parameters = struct {
     preamble: u8 = 4,
 };
 
-const WAKE_TIMEOUT_MS: u32 = 600;
-const WAKE_ATTEMPTS: u32 = 4;
+const WAKE_TIMEOUT_MS: u32 = 100;
+const WAKE_ATTEMPTS: u32 = 8;
 pub const FRAME_PEEK: usize = 18;
 
 pub fn reset(self: *Self) void {
@@ -296,7 +296,7 @@ pub fn setParameters(self: *Self, params: Parameters) RylrError!void {
     const msg = std.mem.print(
         self.tx_buffer,
         "AT+PARAMETER={},{},{},{}\r\n",
-        .{ params.spreading_factor, @intFromEnum(params.bandwidth), params.coding_rate, params.preamble },
+        .{ params.spreading_factor, @backingInt(params.bandwidth), params.coding_rate, params.preamble },
     ) catch return RylrError.BufferTooSmall;
 
     try self.send(msg);
