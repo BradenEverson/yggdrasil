@@ -193,6 +193,7 @@ pub const MessageQueueMap = struct {
     synced_at: u32 = 0,
     hops: u8 = 0xFF,
     tx_at: ?u32 = null,
+    busy_until: ?u32 = null,
     announce_pending: bool = false,
     hello_pending: bool = false,
 };

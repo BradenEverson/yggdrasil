@@ -137,6 +137,7 @@ pub const Yggdrasil = struct {
     old_window: u32 = 0,
     old_window_until: ?u32 = null,
     awake_until: u32 = 0,
+    ack_wait_until: ?u32 = null,
     joining_until: ?u32 = null,
     next_join_at: ?u32 = null,
     hellos_left: u8 = 0,
@@ -170,8 +171,17 @@ pub const Yggdrasil = struct {
             ygg.maintainReport(now);
         }
 
+        if (ygg.ack_wait_until) |until| {
+            if (!reached(now, until))
+                return false;
+            ygg.ack_wait_until = null;
+        }
+
         for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
             if (!neighbor.ack_pending)
+                continue;
+
+            if (busy(neighbor, now))
                 continue;
 
             if (mq.txBuffer(neighbor.mq_idx)) |pending| {
@@ -230,9 +240,31 @@ pub const Yggdrasil = struct {
 
         try ygg.writePacket(packet);
 
-        if (neighbor == null)
+        if (neighbor == null) {
             mq.ackTxBuffer(slot);
+        } else {
+            ygg.expectAck(frameLen(packet));
+        }
 
+        return true;
+    }
+
+    fn expectAck(ygg: *Yggdrasil, len: usize) void {
+        const p = ygg.power orelse return;
+        if (ygg.clock == null)
+            return;
+
+        const until = ygg.currentTime() +% p.frameMs(len) +% p.backoffMs();
+        ygg.ack_wait_until = until;
+        ygg.stayAwake(until);
+    }
+
+    fn busy(neighbor: *routing.MessageQueueMap, now: u32) bool {
+        const until = neighbor.busy_until orelse return false;
+        if (reached(now, until)) {
+            neighbor.busy_until = null;
+            return false;
+        }
         return true;
     }
 
@@ -297,8 +329,10 @@ pub const Yggdrasil = struct {
         return into >= g and into + frame + g <= p.windowMs();
     }
 
-    fn plannedTx(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, from: u32, len: usize) u32 {
-        const p = ygg.power orelse return from;
+    fn plannedTx(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, from_at: u32, len: usize) u32 {
+        const p = ygg.power orelse return from_at;
+
+        const from = if (neighbor.busy_until) |t| (if (after(t, from_at)) t else from_at) else from_at;
 
         if (ygg.lingering(neighbor, from, len)) {
             if (neighbor.tx_at) |t| {
@@ -484,6 +518,9 @@ pub const Yggdrasil = struct {
         neighbor.heard_at = now;
         neighbor.hops = packet.hops;
         neighbor.sched_known = true;
+
+        if (!to_us and !link_layer.isLinkOnly(packet))
+            neighbor.busy_until = now +% p.backoffMs();
         neighbor.period_ms = @as(u32, packet.period) * power.PERIOD_UNIT_MS;
         if (neighbor.period_ms != 0) {
             neighbor.next_window = now -% p.frameMs(frameLen(packet)) +% packet.wake_in;
@@ -2254,6 +2291,68 @@ test "sleepy nodes hold sends to always-on neighbors until their own window clos
     try std.testing.expectEqual(@as(u32, 1000 + p.windowMs()), n.plannedTx(root, 1100, 20));
     try std.testing.expectEqual(@as(u32, 500), n.plannedTx(root, 500, 20));
     try std.testing.expectEqual(@as(u32, 1000 + p.windowMs() + 5), n.plannedTx(root, 1000 + p.windowMs() + 5, 20));
+}
+
+test "a unicast send keeps the radio quiet until its ack can come back" {
+    TestClock.time = 0;
+
+    var n = TestClock.node(2);
+    n.power = .{ .period_ms = 60_000, .radio = .{ .spreading_factor = 7 } };
+    n.own_window = 1000;
+    n.own_window_set = true;
+    const parent = try n.registerNeighbor(1, 0);
+    n.root = .{ .addr = 1, .via = 1, .hops = 1, .seq = 1, .heard_at = 0 };
+    try n.forwarding_table.setRoute(1, parent.mq_idx, 1);
+    const p = n.power.?;
+    const wait = p.frameMs(NetworkPacket.HEADER_LEN + 1 + 2) + p.backoffMs();
+
+    try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
+    try std.testing.expect(try n.requestWrite());
+
+    n.queueAnnouncement(.{ .root = 1, .seq = 1, .hops = 1 }, 0);
+    try std.testing.expect(!try n.requestWrite());
+    TestClock.time = wait - 1;
+    try std.testing.expect(!try n.requestWrite());
+    TestClock.time = wait;
+    try std.testing.expect(try n.requestWrite());
+
+    n.handle_network_packet(.{ .from = 1, .to = 2, .origin = 1, .dest = 2, .hops = 0, .nesn = !parent.sn });
+    try std.testing.expect(n.outgoing_packets.allEmpty());
+
+    try n.sendToRoot("y", MessageQueue.PRIORITY_LOW);
+    TestClock.time += 1;
+    try std.testing.expect(try n.requestWrite());
+    n.queueAnnouncement(.{ .root = 1, .seq = 1, .hops = 1 }, 0);
+    try std.testing.expect(!try n.requestWrite());
+
+    n.handle_network_packet(.{ .from = 1, .to = 2, .origin = 1, .dest = 2, .hops = 0, .nesn = !parent.sn });
+    try std.testing.expect(n.ack_wait_until == null);
+    try std.testing.expect(try n.requestWrite());
+}
+
+test "a neighbor overheard sending to someone else is left alone until its ack is back" {
+    TestClock.time = 0;
+
+    var n = TestClock.node(3);
+    n.power = .{ .period_ms = 60_000, .radio = .{ .spreading_factor = 7 } };
+    n.own_window = 1000;
+    n.own_window_set = true;
+    const parent = try n.registerNeighbor(2, 0);
+    n.root = .{ .addr = 1, .via = 2, .hops = 2, .seq = 1, .heard_at = 0 };
+    try n.forwarding_table.setRoute(1, parent.mq_idx, 2);
+    try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
+    const p = n.power.?;
+
+    var overheard = NetworkPacket{ .from = 2, .to = 1, .origin = 2, .dest = 1, .len = 1, .period = 600, .wake_in = 30_000, .hops = 1 };
+    overheard.payload[0] = 'y';
+    n.handle_network_packet(overheard);
+
+    try std.testing.expect(!try n.requestWrite());
+    TestClock.time = p.backoffMs() - 1;
+    try std.testing.expect(!try n.requestWrite());
+    TestClock.time = p.backoffMs();
+    try std.testing.expect(try n.requestWrite());
+    try std.testing.expect(parent.sent);
 }
 
 test "rooted sleepy nodes beacon right after their own window every few periods" {

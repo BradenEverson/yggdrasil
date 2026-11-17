@@ -177,8 +177,20 @@ fn serviceRadio() void {
     ygg.readStream() catch |e| log("read failed: {s}\r\n", .{@errorName(e)});
     if (lora.received != seen_frames) {
         seen_frames = lora.received;
-        traceFrame("rx", lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)]);
+        const f = lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)];
+        traceFrame("rx", f);
+        logSignal(f);
     }
+}
+
+fn logSignal(f: []const u8) void {
+    if (f.len < 5) {
+        log("sig ? rssi={} snr={}\r\n", .{ lora.last_rssi, lora.last_snr });
+        return;
+    }
+    const from = (@as(u16, f[1]) << 8) | f[2];
+    const to = (@as(u16, f[3]) << 8) | f[4];
+    log("sig {}>{} rssi={} snr={}\r\n", .{ from, to, lora.last_rssi, lora.last_snr });
 }
 
 fn configureRadio() Rylr.RylrError!void {

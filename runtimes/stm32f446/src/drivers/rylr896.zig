@@ -24,6 +24,12 @@ received: u32 = 0,
 last_rx: [FRAME_PEEK]u8 = undefined,
 last_rx_len: usize = 0,
 rx_index: usize = 0,
+last_rssi: i16 = 0,
+last_snr: i16 = 0,
+rcv_complete: bool = false,
+trailer_field: u8 = 0,
+trailer_value: i16 = 0,
+trailer_negative: bool = false,
 
 const Self = @This();
 
@@ -169,13 +175,19 @@ fn feed(self: *Self, byte: u8) ?Response {
         },
         .rcv_len => {
             if (byte == ',') {
-                self.line_state = if (self.rcv_remaining == 0) .rcv_trailer else .rcv_data;
                 self.last_rx_len = self.rcv_remaining;
                 self.rx_index = 0;
+                if (self.rcv_remaining == 0) {
+                    self.startTrailer(false);
+                } else {
+                    self.line_state = .rcv_data;
+                }
             } else if (byte >= '0' and byte <= '9' and self.rcv_remaining < 1000) {
                 self.rcv_remaining = self.rcv_remaining * 10 + (byte - '0');
+            } else if (byte == '\n') {
+                self.line_state = .text;
             } else {
-                self.line_state = if (byte == '\n') .text else .rcv_trailer;
+                self.startTrailer(false);
             }
         },
         .rcv_data => {
@@ -183,18 +195,49 @@ fn feed(self: *Self, byte: u8) ?Response {
             self.rx_index += 1;
             self.pushInbox(byte);
             self.rcv_remaining -= 1;
-            if (self.rcv_remaining == 0) {
-                self.line_state = .rcv_trailer;
-                self.received +%= 1;
-            }
+            if (self.rcv_remaining == 0)
+                self.startTrailer(true);
         },
-        .rcv_trailer => {
-            if (byte == '\n')
-                self.line_state = .text;
-        },
+        .rcv_trailer => self.feedTrailer(byte),
     }
 
     return null;
+}
+
+fn startTrailer(self: *Self, complete: bool) void {
+    self.line_state = .rcv_trailer;
+    self.rcv_complete = complete;
+    self.trailer_field = 0;
+    self.trailer_value = 0;
+    self.trailer_negative = false;
+}
+
+fn feedTrailer(self: *Self, byte: u8) void {
+    switch (byte) {
+        ',', '\n' => {
+            const value = if (self.trailer_negative) -self.trailer_value else self.trailer_value;
+            switch (self.trailer_field) {
+                1 => self.last_rssi = value,
+                2 => self.last_snr = value,
+                else => {},
+            }
+            self.trailer_field +|= 1;
+            self.trailer_value = 0;
+            self.trailer_negative = false;
+
+            if (byte == '\n') {
+                self.line_state = .text;
+                if (self.rcv_complete) self.received +%= 1;
+                self.rcv_complete = false;
+            }
+        },
+        '-' => self.trailer_negative = true,
+        '0'...'9' => {
+            if (self.trailer_value < 1000)
+                self.trailer_value = self.trailer_value * 10 + (byte - '0');
+        },
+        else => {},
+    }
 }
 
 fn classify(line: []const u8) Response {

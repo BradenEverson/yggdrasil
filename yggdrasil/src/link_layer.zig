@@ -28,6 +28,7 @@ pub fn isLinkOnly(packet: *const NetworkPacket) bool {
 pub fn processAck(ygg: *Yggdrasil, mq_map: *routing.MessageQueueMap, nesn: bool) void {
     if (nesn != mq_map.sn) {
         ygg.outgoing_packets.ackTxBuffer(mq_map.mq_idx);
+        ygg.ack_wait_until = null;
         mq_map.sn = !mq_map.sn;
         mq_map.sent = false;
         mq_map.retries = 0;
