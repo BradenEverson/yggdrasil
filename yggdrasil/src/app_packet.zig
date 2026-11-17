@@ -30,6 +30,7 @@ pub const Opcode = enum(u8) {
     /// The true application level data, a collection of
     /// sensor readings from this node to a central hub
     sensor_readings,
+    compact_readings,
 };
 
 op: Opcode = .hello,
@@ -126,6 +127,120 @@ pub const TopologyInfo = struct {
             std.mem.writeInt(u16, buf[HEADER_LEN + i * 2 ..][0..2], addr, .big);
 
         return buf[0..len];
+    }
+};
+
+pub const CompactReadings = struct {
+    centi_celsius: ?i16 = null,
+    deci_hpa: ?u16 = null,
+    centi_pct: ?u16 = null,
+    gas_log2_q11: ?u16 = null,
+
+    pub const MAX_LEN: usize = 9;
+    pub const GAS_Q: f32 = 2048.0;
+
+    const Field = enum(u3) { temperature, pressure, humidity, gas };
+
+    pub fn temperature(celsius: f32) i16 {
+        return quantize(i16, celsius * 100.0);
+    }
+
+    pub fn pressure(pa: f32) u16 {
+        return quantize(u16, pa / 10.0);
+    }
+
+    pub fn humidity(pct: f32) u16 {
+        return quantize(u16, pct * 100.0);
+    }
+
+    pub fn gas(ohm: f32) ?u16 {
+        if (!(ohm >= 1.0)) return null;
+        return quantize(u16, @log2(ohm) * GAS_Q);
+    }
+
+    fn quantize(comptime T: type, x: f32) T {
+        if (x != x) return 0;
+        const lo: f32 = @floatFromInt(std.math.minInt(T));
+        const hi: f32 = @floatFromInt(std.math.maxInt(T));
+        return @intFromFloat(@round(std.math.clamp(x, lo, hi)));
+    }
+
+    fn bit(field: Field) u8 {
+        return @as(u8, 1) << @intFromEnum(field);
+    }
+
+    pub fn write(r: CompactReadings, buf: *[MAX_LEN]u8) []const u8 {
+        var mask: u8 = 0;
+        var n: usize = 1;
+        if (r.centi_celsius) |v| {
+            mask |= bit(.temperature);
+            std.mem.writeInt(i16, buf[n..][0..2], v, .big);
+            n += 2;
+        }
+        if (r.deci_hpa) |v| {
+            mask |= bit(.pressure);
+            std.mem.writeInt(u16, buf[n..][0..2], v, .big);
+            n += 2;
+        }
+        if (r.centi_pct) |v| {
+            mask |= bit(.humidity);
+            std.mem.writeInt(u16, buf[n..][0..2], v, .big);
+            n += 2;
+        }
+        if (r.gas_log2_q11) |v| {
+            mask |= bit(.gas);
+            std.mem.writeInt(u16, buf[n..][0..2], v, .big);
+            n += 2;
+        }
+        buf[0] = mask;
+        return buf[0..n];
+    }
+
+    pub fn parse(payload: []const u8) ?CompactReadings {
+        if (payload.len == 0) return null;
+        const mask = payload[0];
+        if (mask & ~@as(u8, 0x0F) != 0) return null;
+        if (payload.len != 1 + 2 * @as(usize, @popCount(mask))) return null;
+
+        var r: CompactReadings = .{};
+        var n: usize = 1;
+        if (mask & bit(.temperature) != 0) {
+            r.centi_celsius = std.mem.readInt(i16, payload[n..][0..2], .big);
+            n += 2;
+        }
+        if (mask & bit(.pressure) != 0) {
+            r.deci_hpa = std.mem.readInt(u16, payload[n..][0..2], .big);
+            n += 2;
+        }
+        if (mask & bit(.humidity) != 0) {
+            r.centi_pct = std.mem.readInt(u16, payload[n..][0..2], .big);
+            n += 2;
+        }
+        if (mask & bit(.gas) != 0) {
+            r.gas_log2_q11 = std.mem.readInt(u16, payload[n..][0..2], .big);
+            n += 2;
+        }
+        return r;
+    }
+
+    pub fn toCelsius(r: CompactReadings) ?f32 {
+        const v = r.centi_celsius orelse return null;
+        return @as(f32, @floatFromInt(v)) / 100.0;
+    }
+
+    pub fn toHpa(r: CompactReadings) ?f32 {
+        const v = r.deci_hpa orelse return null;
+        return @as(f32, @floatFromInt(v)) / 10.0;
+    }
+
+    pub fn toPct(r: CompactReadings) ?f32 {
+        const v = r.centi_pct orelse return null;
+        return @as(f32, @floatFromInt(v)) / 100.0;
+    }
+
+    pub fn toOhm(r: CompactReadings) ?f32 {
+        const v = r.gas_log2_q11 orelse return null;
+        return @exp2(@as(f32, @floatFromInt(v)) / GAS_Q);
     }
 };
 
@@ -441,6 +556,58 @@ test "Sensor writer round trips through the stream" {
     var small: [8]u8 = undefined;
     var full = SensorReadingWriter{ .buf = &small };
     try std.testing.expectError(error.NoSpaceLeft, full.add("too_long", .{ .uint8 = 1 }));
+}
+
+test "Compact readings round trip within quantization" {
+    const r: CompactReadings = .{
+        .centi_celsius = CompactReadings.temperature(24.37),
+        .deci_hpa = CompactReadings.pressure(100_418.0),
+        .centi_pct = CompactReadings.humidity(27.36),
+        .gas_log2_q11 = CompactReadings.gas(56_164.0),
+    };
+
+    var buf: [CompactReadings.MAX_LEN]u8 = undefined;
+    const bytes = r.write(&buf);
+    try std.testing.expectEqual(@as(usize, 9), bytes.len);
+    try std.testing.expectEqual(@as(u8, 0x0F), bytes[0]);
+
+    const back = CompactReadings.parse(bytes).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 24.37), back.toCelsius().?, 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 1004.18), back.toHpa().?, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 27.36), back.toPct().?, 0.005);
+    try std.testing.expectApproxEqRel(@as(f32, 56_164.0), back.toOhm().?, 0.0005);
+}
+
+test "Compact readings skip missing fields" {
+    const r: CompactReadings = .{
+        .centi_celsius = CompactReadings.temperature(-12.5),
+        .centi_pct = CompactReadings.humidity(80.0),
+    };
+
+    var buf: [CompactReadings.MAX_LEN]u8 = undefined;
+    const bytes = r.write(&buf);
+    try std.testing.expectEqualSlices(u8, &.{ 0x05, 0xFB, 0x1E, 0x1F, 0x40 }, bytes);
+
+    const back = CompactReadings.parse(bytes).?;
+    try std.testing.expectEqual(@as(?i16, -1250), back.centi_celsius);
+    try std.testing.expectEqual(@as(?u16, null), back.deci_hpa);
+    try std.testing.expectEqual(@as(?u16, 8000), back.centi_pct);
+    try std.testing.expectEqual(@as(?u16, null), back.gas_log2_q11);
+}
+
+test "Compact readings reject malformed payloads" {
+    try std.testing.expect(CompactReadings.parse(&.{}) == null);
+    try std.testing.expect(CompactReadings.parse(&.{ 0x01, 0x00 }) == null);
+    try std.testing.expect(CompactReadings.parse(&.{ 0x01, 0x00, 0x00, 0x00 }) == null);
+    try std.testing.expect(CompactReadings.parse(&.{ 0x10, 0x00, 0x00 }) == null);
+}
+
+test "Compact quantization clamps out of range values" {
+    try std.testing.expectEqual(@as(i16, std.math.maxInt(i16)), CompactReadings.temperature(1000.0));
+    try std.testing.expectEqual(@as(u16, 0), CompactReadings.humidity(-5.0));
+    try std.testing.expectEqual(@as(?u16, null), CompactReadings.gas(0.0));
+    try std.testing.expectEqual(@as(?u16, null), CompactReadings.gas(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(i16, 0), CompactReadings.temperature(std.math.nan(f32)));
 }
 
 test "Value parsing" {

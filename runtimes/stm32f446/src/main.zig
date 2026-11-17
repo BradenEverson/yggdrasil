@@ -347,26 +347,20 @@ fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688) void {
         return;
     };
 
-    var readings_buf: [yggdrasil.NetworkPacket.MAX_PAYLOAD_SIZE - 1]u8 = undefined;
-    var readings = yggdrasil.AppPacket.SensorReadingWriter{ .buf = &readings_buf };
-
-    addReadings(&readings, r) catch |e| {
-        log("encode failed: {s}\r\n", .{@errorName(e)});
-        return;
-    };
-
-    const packet: yggdrasil.AppPacket = .{ .op = .sensor_readings, .payload = readings.written() };
+    var readings_buf: [yggdrasil.AppPacket.CompactReadings.MAX_LEN]u8 = undefined;
+    const packet: yggdrasil.AppPacket = .{ .op = .compact_readings, .payload = compactReadings(r).write(&readings_buf) };
 
     node.sendAppToRoot(packet, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
         log("send failed: {s}\r\n", .{@errorName(e)});
     };
 }
 
-fn addReadings(readings: *yggdrasil.AppPacket.SensorReadingWriter, r: bme688.Reading) error{NoSpaceLeft}!void {
-    try readings.add("t", .{ .float32 = r.temperatureF() });
-    try readings.add("p", .{ .float32 = r.pressureHpa() });
-    try readings.add("h", .{ .float32 = r.humidity_pct });
-
-    if (r.gas_valid and r.heater_stable)
-        try readings.add("g", .{ .float32 = r.gas_resistance_ohm });
+fn compactReadings(r: bme688.Reading) yggdrasil.AppPacket.CompactReadings {
+    const C = yggdrasil.AppPacket.CompactReadings;
+    return .{
+        .centi_celsius = C.temperature(r.temperature_c),
+        .deci_hpa = C.pressure(r.pressure_pa),
+        .centi_pct = C.humidity(r.humidity_pct),
+        .gas_log2_q11 = if (r.gas_valid and r.heater_stable) C.gas(r.gas_resistance_ohm) else null,
+    };
 }

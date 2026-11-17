@@ -12,8 +12,17 @@ OP_IM_A_ROOT = 1
 OP_CONFIGURE_STREAM = 2
 OP_TOPOLOGY_INFO = 3
 OP_SENSOR_READINGS = 4
+OP_COMPACT_READINGS = 5
 
 _VALUE_FORMATS = ["B", "H", "I", "Q", "b", "h", "i", "q", "f", "d"]
+_FLOAT32 = _VALUE_FORMATS.index("f")
+
+_COMPACT_FIELDS = [
+    ("t", ">h", lambda v: v / 100.0 * 9.0 / 5.0 + 32.0),
+    ("p", ">H", lambda v: v / 10.0),
+    ("h", ">H", lambda v: v / 100.0),
+    ("g", ">H", lambda v: 2.0 ** (v / 2048.0)),
+]
 
 _WRITE_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 _PACKET_CB = ctypes.CFUNCTYPE(
@@ -188,3 +197,30 @@ def parse_sensor_readings(payload):
         readings.append((name, value))
         i += 1 + entry_len
     return readings
+
+
+def parse_compact_readings(payload):
+    if not payload:
+        return []
+    mask = payload[0]
+    if mask >> len(_COMPACT_FIELDS) or len(payload) != 1 + 2 * bin(mask).count("1"):
+        return []
+    readings = []
+    i = 1
+    for bit, (name, fmt, decode) in enumerate(_COMPACT_FIELDS):
+        if mask & (1 << bit):
+            (raw,) = struct.unpack(fmt, payload[i:i + 2])
+            readings.append((name, decode(raw)))
+            i += 2
+    return readings
+
+
+def encode_sensor_readings(readings):
+    out = bytearray()
+    for name, value in readings:
+        raw = name.encode()
+        out.append(1 + len(raw) + 4)
+        out.append(_FLOAT32)
+        out += raw
+        out += struct.pack(">f", value)
+    return bytes(out)

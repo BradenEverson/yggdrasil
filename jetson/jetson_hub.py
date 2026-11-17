@@ -213,17 +213,22 @@ class Hub(object):
         op, payload = app
 
         if op == yggdrasil.OP_SENSOR_READINGS and not broadcast:
-            self.on_readings(origin, from_addr, payload)
+            self.on_readings(origin, from_addr, yggdrasil.parse_sensor_readings(payload), bytes(payload))
+        elif op == yggdrasil.OP_COMPACT_READINGS and not broadcast:
+            readings = yggdrasil.parse_compact_readings(payload)
+            self.on_readings(origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
         elif op == yggdrasil.OP_HELLO and broadcast:
             print(f"Hello from {from_addr}")
 
-    def on_readings(self, origin, from_addr, payload):
-        readings = yggdrasil.parse_sensor_readings(payload)
+    def on_readings(self, origin, from_addr, readings, wire):
+        if not readings:
+            print(f"Malformed readings from Node {origin} (via {from_addr})")
+            return
         pretty = "  ".join(f"{n}={v:.2f}" if isinstance(v, float) else f"{n}={v}" for n, v in readings)
         print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}): {pretty}")
 
         if self.stream is not None:
-            self.stream.send(struct.pack(">H", origin) + bytes(payload))
+            self.stream.send(struct.pack(">H", origin) + wire)
             return
 
         row = {
