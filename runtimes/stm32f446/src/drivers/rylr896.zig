@@ -103,9 +103,8 @@ pub const Parameters = struct {
     preamble: u8 = 4,
 };
 
-const WAKE_TIMEOUT_MS: u32 = 20;
-const WAKE_ATTEMPTS: u32 = 40;
-const WAKE_DRAIN_MS: u32 = 10;
+const WAKE_READY_TIMEOUT_MS: u32 = 250;
+const WAKE_ATTEMPTS: u32 = 4;
 pub const FRAME_PEEK: usize = 18;
 
 pub fn reset(self: *Self) void {
@@ -339,24 +338,14 @@ pub fn wake(self: *Self) RylrError!void {
         self.last_wake.attempts = attempt + 1;
         self.line_len = 0;
         hal.uart.writeStr(self.uart, "AT\r\n");
-        self.awaitReply(WAKE_TIMEOUT_MS, true) catch continue;
+        self.awaitReply(WAKE_READY_TIMEOUT_MS, true) catch continue;
         self.last_wake.at_ms = hal.timer.millis() -% start;
-        self.drainReplies(WAKE_DRAIN_MS);
         self.line_len = 0;
         self.restore() catch continue;
         return;
     }
 
     return RylrError.Timeout;
-}
-
-fn drainReplies(self: *Self, quiet_ms: u32) void {
-    var last = hal.timer.millis();
-    while (hal.timer.millis() -% last < quiet_ms) {
-        const byte = hal.uart.tryReadByte(self.uart) orelse continue;
-        _ = self.feed(byte);
-        last = hal.timer.millis();
-    }
 }
 
 fn restore(self: *Self) RylrError!void {
