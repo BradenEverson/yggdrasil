@@ -3,6 +3,9 @@ import os
 import struct
 import time
 
+BROADCAST_ADDR = 0xFF
+MAX_ADDRESS = 0xFE
+
 PRIORITY_HIGH = 0
 PRIORITY_LOW = 10
 
@@ -13,6 +16,7 @@ OP_CONFIGURE_STREAM = 2
 OP_TOPOLOGY_INFO = 3
 OP_SENSOR_READINGS = 4
 OP_COMPACT_READINGS = 5
+OP_BATCHED_READINGS = 6
 
 _VALUE_FORMATS = ["B", "H", "I", "Q", "b", "h", "i", "q", "f", "d"]
 _FLOAT32 = _VALUE_FORMATS.index("f")
@@ -27,14 +31,14 @@ _COMPACT_FIELDS = [
 _WRITE_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 _PACKET_CB = ctypes.CFUNCTYPE(
     None,
-    ctypes.c_uint16,
-    ctypes.c_uint16,
-    ctypes.c_uint16,
+    ctypes.c_uint8,
+    ctypes.c_uint8,
+    ctypes.c_uint8,
     ctypes.c_bool,
     ctypes.POINTER(ctypes.c_uint8),
     ctypes.c_size_t,
 )
-_LOST_CB = ctypes.CFUNCTYPE(None, ctypes.c_uint16)
+_LOST_CB = ctypes.CFUNCTYPE(None, ctypes.c_uint8)
 
 
 def _find_library():
@@ -55,7 +59,7 @@ def _find_library():
 
 def _load(path):
     lib = ctypes.CDLL(path)
-    lib.ygg_init.argtypes = [ctypes.c_uint16, ctypes.c_bool, _WRITE_CB, _PACKET_CB, _LOST_CB]
+    lib.ygg_init.argtypes = [ctypes.c_uint8, ctypes.c_bool, _WRITE_CB, _PACKET_CB, _LOST_CB]
     lib.ygg_init.restype = None
     lib.ygg_configure_power.argtypes = [ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint8]
     lib.ygg_configure_power.restype = None
@@ -81,7 +85,7 @@ def _load(path):
     lib.ygg_announce_topology.restype = None
     lib.ygg_root_address.argtypes = []
     lib.ygg_root_address.restype = ctypes.c_int32
-    lib.ygg_send.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint8]
+    lib.ygg_send.argtypes = [ctypes.c_uint8, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint8]
     lib.ygg_send.restype = ctypes.c_int
     lib.ygg_neighbor_count.argtypes = []
     lib.ygg_neighbor_count.restype = ctypes.c_uint32
@@ -98,6 +102,8 @@ class Node(object):
         self.on_packet = on_packet
         self.on_neighbor_lost = on_neighbor_lost
         self._t0 = time.monotonic()
+        if not 0 <= address <= MAX_ADDRESS:
+            raise ValueError(f"address must be 0-{MAX_ADDRESS}, got {address}")
 
         self._write_cb = _WRITE_CB(self._c_write)
         self._packet_cb = _PACKET_CB(self._c_packet)
@@ -199,11 +205,17 @@ def parse_sensor_readings(payload):
     return readings
 
 
+def _compact_len(mask):
+    if mask >> len(_COMPACT_FIELDS):
+        return None
+    return 1 + 2 * bin(mask).count("1")
+
+
 def parse_compact_readings(payload):
     if not payload:
         return []
     mask = payload[0]
-    if mask >> len(_COMPACT_FIELDS) or len(payload) != 1 + 2 * bin(mask).count("1"):
+    if len(payload) != _compact_len(mask):
         return []
     readings = []
     i = 1
@@ -224,3 +236,20 @@ def encode_sensor_readings(readings):
         out += raw
         out += struct.pack(">f", value)
     return bytes(out)
+
+
+def parse_batched_readings(payload):
+    entries = []
+    i = 0
+    while i < len(payload):
+        if i + 2 > len(payload):
+            return []
+        size = _compact_len(payload[i + 1])
+        if size is None or i + 1 + size > len(payload):
+            return []
+        readings = parse_compact_readings(payload[i + 1:i + 1 + size])
+        if not readings:
+            return []
+        entries.append((payload[i], readings))
+        i += 1 + size
+    return entries

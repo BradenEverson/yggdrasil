@@ -22,7 +22,7 @@ pub fn linkLayerProcess(
 }
 
 pub fn isLinkOnly(packet: *const NetworkPacket) bool {
-    return packet.len == 0 and !packet.ack and !packet.nack and !packet.broadcast;
+    return packet.len == 0 and !packet.ack and !packet.broadcast;
 }
 
 pub fn processAck(ygg: *Yggdrasil, mq_map: *routing.MessageQueueMap, nesn: bool) void {

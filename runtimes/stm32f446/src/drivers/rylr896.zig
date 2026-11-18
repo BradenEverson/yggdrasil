@@ -14,6 +14,9 @@ rcv_remaining: usize = 0,
 inbox: [INBOX_SIZE]u8 = undefined,
 inbox_head: u32 = 0,
 inbox_tail: u32 = 0,
+inbox_commit: u32 = 0,
+inbox_frame_start: u32 = 0,
+inbox_frame_ok: bool = false,
 inbox_dropped: u32 = 0,
 
 params: ?Parameters = null,
@@ -107,6 +110,7 @@ pub const FRAME_PEEK: usize = 18;
 pub fn reset(self: *Self) void {
     self.line_state = .text;
     self.line_len = 0;
+    self.endFrame(false);
     hal.uart.writeStr(self.uart, "AT+RESET\r\n");
 }
 
@@ -119,29 +123,52 @@ pub fn poll(self: *Self) void {
 
 pub fn pending(self: *Self) bool {
     self.poll();
-    return self.inbox_head != self.inbox_tail;
+    return self.inbox_commit != self.inbox_tail;
 }
 
 pub fn read(self: *Self, buf: []u8) []u8 {
     self.poll();
+    if (self.inbox_commit == self.inbox_tail)
+        return buf[0..0];
 
-    var n: usize = 0;
-    while (n < buf.len and self.inbox_head != self.inbox_tail) : (n += 1) {
-        buf[n] = self.inbox[self.inbox_tail % INBOX_SIZE];
-        self.inbox_tail +%= 1;
+    const len: usize = self.inbox[self.inbox_tail % INBOX_SIZE];
+    self.inbox_tail +%= 1;
+    defer self.inbox_tail +%= @intCast(len);
+
+    if (len > buf.len) {
+        self.inbox_dropped +%= 1;
+        return buf[0..0];
     }
 
-    return buf[0..n];
+    for (0..len) |i| buf[i] = self.inbox[(self.inbox_tail +% @as(u32, @intCast(i))) % INBOX_SIZE];
+    return buf[0..len];
 }
 
-fn pushInbox(self: *Self, byte: u8) void {
-    if (self.inbox_head -% self.inbox_tail >= INBOX_SIZE) {
+fn beginFrame(self: *Self, len: usize) void {
+    self.inbox_head = self.inbox_commit;
+    self.inbox_frame_start = self.inbox_head;
+    const free = INBOX_SIZE - (self.inbox_head -% self.inbox_tail);
+    self.inbox_frame_ok = len <= std.math.maxInt(u8) and len + 1 <= free;
+    if (!self.inbox_frame_ok) {
         self.inbox_dropped +%= 1;
         return;
     }
+    self.inbox[self.inbox_head % INBOX_SIZE] = @intCast(len);
+    self.inbox_head +%= 1;
+}
 
+fn pushInbox(self: *Self, byte: u8) void {
+    if (!self.inbox_frame_ok) return;
     self.inbox[self.inbox_head % INBOX_SIZE] = byte;
     self.inbox_head +%= 1;
+}
+
+fn endFrame(self: *Self, complete: bool) void {
+    if (complete and self.inbox_frame_ok)
+        self.inbox_commit = self.inbox_head
+    else
+        self.inbox_head = self.inbox_commit;
+    self.inbox_frame_ok = false;
 }
 
 fn feed(self: *Self, byte: u8) ?Response {
@@ -177,6 +204,7 @@ fn feed(self: *Self, byte: u8) ?Response {
             if (byte == ',') {
                 self.last_rx_len = self.rcv_remaining;
                 self.rx_index = 0;
+                self.beginFrame(self.rcv_remaining);
                 if (self.rcv_remaining == 0) {
                     self.startTrailer(false);
                 } else {
@@ -228,6 +256,7 @@ fn feedTrailer(self: *Self, byte: u8) void {
             if (byte == '\n') {
                 self.line_state = .text;
                 if (self.rcv_complete) self.received +%= 1;
+                self.endFrame(self.rcv_complete);
                 self.rcv_complete = false;
             }
         },
@@ -299,6 +328,7 @@ pub fn sleep(self: *Self) RylrError!void {
 pub fn wake(self: *Self) RylrError!void {
     self.line_state = .text;
     self.line_len = 0;
+    self.endFrame(false);
 
     self.last_wake = .{};
     const start = hal.timer.millis();

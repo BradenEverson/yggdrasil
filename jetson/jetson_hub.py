@@ -142,18 +142,30 @@ class WebSocketStream(object):
 
 
 def describe_frame(frame):
-    if len(frame) < 18 or frame[0] != 0x72:
+    if len(frame) < 4:
         return f"(not a frame, {len(frame)} bytes)"
-    src = (frame[1] << 8) | frame[2]
-    dst = (frame[3] << 8) | frame[4]
-    flags = frame[10]
-    length = frame[11]
-    wake = (frame[12] << 16) | (frame[13] << 8) | frame[14]
-    period = ((frame[15] << 8) | frame[16]) * 100
-    hops = frame[17]
-    names = [n for i, n in enumerate(["ack", "bcast", "nack", "sn", "nesn"]) if flags & (1 << (7 - i))]
-    op = frame[18] if length else None
-    return f"{src}>{dst} len={length} op={op} hops={hops} period={period} wake={wake} [{','.join(names)}]"
+    flags, src, dst, hops = frame[0], frame[1], frame[2], frame[3]
+    i = 4
+    origin, dest, ttl, wake, period = src, dst, None, None, None
+    if flags & 0x08:
+        origin = frame[i] if i < len(frame) else None
+        i += 1
+    if flags & 0x04:
+        dest, ttl = (frame[i], frame[i + 1]) if i + 1 < len(frame) else (None, None)
+        i += 2
+    if flags & 0x02:
+        wake = int.from_bytes(frame[i:i + 2], "big") / 65536.0 if i + 1 < len(frame) else None
+        i += 2
+    if flags & 0x01:
+        period = int.from_bytes(frame[i:i + 2], "big") * 100 if i + 1 < len(frame) else None
+        i += 2
+    if i > len(frame):
+        return f"(truncated frame, {len(frame)} bytes)"
+    names = [n for b, n in ((0x80, "ack"), (0x40, "bcast"), (0x20, "sn"), (0x10, "nesn")) if flags & b]
+    op = frame[i] if i < len(frame) else None
+    route = f" {origin}=>{dest} ttl={ttl}" if (origin, dest) != (src, dst) or ttl is not None else ""
+    sched = "" if wake is None else f" wake={wake:.3f}" + ("" if period is None else f" period={period}")
+    return f"{src}>{dst}{route} len={len(frame) - i} op={op} hops={hops}{sched} [{','.join(names)}]"
 
 
 class Hub(object):
@@ -217,6 +229,12 @@ class Hub(object):
         elif op == yggdrasil.OP_COMPACT_READINGS and not broadcast:
             readings = yggdrasil.parse_compact_readings(payload)
             self.on_readings(origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
+        elif op == yggdrasil.OP_BATCHED_READINGS and not broadcast:
+            entries = yggdrasil.parse_batched_readings(payload)
+            if not entries:
+                print(f"Malformed batch from Node {origin} (via {from_addr})")
+            for entry_origin, readings in entries:
+                self.on_readings(entry_origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
         elif op == yggdrasil.OP_HELLO and broadcast:
             print(f"Hello from {from_addr}")
 

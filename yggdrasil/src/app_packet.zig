@@ -1,6 +1,7 @@
 //! Application level packet
 
 const std = @import("std");
+const Address = @import("network_packet.zig").Address;
 
 pub const Opcode = enum(u8) {
     /// Message sent by a node who just woke up
@@ -31,6 +32,7 @@ pub const Opcode = enum(u8) {
     /// sensor readings from this node to a central hub
     sensor_readings,
     compact_readings,
+    batched_readings,
 };
 
 op: Opcode = .hello,
@@ -61,70 +63,69 @@ pub fn write(app: AppPacket, buf: []u8) error{NoSpaceLeft}![]u8 {
 }
 
 pub const RootAnnouncement = struct {
-    root: u16,
+    root: Address,
     seq: u16,
     hops: u8,
 
-    pub const LEN: usize = 5;
+    pub const LEN: usize = 4;
 
     pub fn parse(payload: []const u8) ?RootAnnouncement {
         if (payload.len < LEN)
             return null;
 
         return .{
-            .root = std.mem.readInt(u16, payload[0..2], .big),
-            .seq = std.mem.readInt(u16, payload[2..4], .big),
-            .hops = payload[4],
+            .root = payload[0],
+            .seq = std.mem.readInt(u16, payload[1..3], .big),
+            .hops = payload[3],
         };
     }
 
     pub fn write(ann: RootAnnouncement, buf: *[LEN]u8) void {
-        std.mem.writeInt(u16, buf[0..2], ann.root, .big);
-        std.mem.writeInt(u16, buf[2..4], ann.seq, .big);
-        buf[4] = ann.hops;
+        buf[0] = ann.root;
+        std.mem.writeInt(u16, buf[1..3], ann.seq, .big);
+        buf[3] = ann.hops;
     }
 };
 
 pub const TopologyInfo = struct {
-    origin: u16,
+    origin: Address,
     seq: u16,
     neighbor_bytes: []const u8,
 
-    pub const HEADER_LEN: usize = 5;
+    pub const HEADER_LEN: usize = 4;
 
     pub fn parse(payload: []const u8) ?TopologyInfo {
         if (payload.len < HEADER_LEN)
             return null;
 
-        const n: usize = payload[4];
-        if (payload.len < HEADER_LEN + n * 2)
+        const n: usize = payload[3];
+        if (payload.len < HEADER_LEN + n)
             return null;
 
         return .{
-            .origin = std.mem.readInt(u16, payload[0..2], .big),
-            .seq = std.mem.readInt(u16, payload[2..4], .big),
-            .neighbor_bytes = payload[HEADER_LEN..][0 .. n * 2],
+            .origin = payload[0],
+            .seq = std.mem.readInt(u16, payload[1..3], .big),
+            .neighbor_bytes = payload[HEADER_LEN..][0..n],
         };
     }
 
     pub fn count(info: TopologyInfo) usize {
-        return info.neighbor_bytes.len / 2;
+        return info.neighbor_bytes.len;
     }
 
-    pub fn neighbor(info: TopologyInfo, i: usize) u16 {
-        return std.mem.readInt(u16, info.neighbor_bytes[i * 2 ..][0..2], .big);
+    pub fn neighbor(info: TopologyInfo, i: usize) Address {
+        return info.neighbor_bytes[i];
     }
 
-    pub fn write(origin: u16, seq: u16, neighbors: []const u16, buf: []u8) error{NoSpaceLeft}![]u8 {
-        const len = HEADER_LEN + neighbors.len * 2;
+    pub fn write(origin: Address, seq: u16, neighbors: []const Address, buf: []u8) error{NoSpaceLeft}![]u8 {
+        const len = HEADER_LEN + neighbors.len;
         if (neighbors.len > std.math.maxInt(u8) or buf.len < len)
             return error.NoSpaceLeft;
 
-        std.mem.writeInt(u16, buf[0..2], origin, .big);
-        std.mem.writeInt(u16, buf[2..4], seq, .big);
-        buf[4] = @intCast(neighbors.len);
-        for (neighbors, 0..) |addr, i|
-            std.mem.writeInt(u16, buf[HEADER_LEN + i * 2 ..][0..2], addr, .big);
+        buf[0] = origin;
+        std.mem.writeInt(u16, buf[1..3], seq, .big);
+        buf[3] = @intCast(neighbors.len);
+        @memcpy(buf[HEADER_LEN..][0..neighbors.len], neighbors);
 
         return buf[0..len];
     }
@@ -196,11 +197,15 @@ pub const CompactReadings = struct {
         return buf[0..n];
     }
 
+    pub fn recordLen(mask: u8) ?usize {
+        if (mask & ~@as(u8, 0x0F) != 0) return null;
+        return 1 + 2 * @as(usize, @popCount(mask));
+    }
+
     pub fn parse(payload: []const u8) ?CompactReadings {
         if (payload.len == 0) return null;
         const mask = payload[0];
-        if (mask & ~@as(u8, 0x0F) != 0) return null;
-        if (payload.len != 1 + 2 * @as(usize, @popCount(mask))) return null;
+        if (payload.len != recordLen(mask) orelse return null) return null;
 
         var r: CompactReadings = .{};
         var n: usize = 1;
@@ -241,6 +246,32 @@ pub const CompactReadings = struct {
     pub fn toOhm(r: CompactReadings) ?f32 {
         const v = r.gas_log2_q11 orelse return null;
         return @exp2(@as(f32, @floatFromInt(v)) / GAS_Q);
+    }
+};
+
+pub const ReadingBatch = struct {
+    bytes: []const u8,
+
+    pub const Entry = struct {
+        origin: Address,
+        readings: CompactReadings,
+    };
+
+    pub fn next(batch: *ReadingBatch) ?Entry {
+        if (batch.bytes.len < 2) return null;
+        const len = CompactReadings.recordLen(batch.bytes[1]) orelse return null;
+        if (batch.bytes.len < 1 + len) return null;
+        const readings = CompactReadings.parse(batch.bytes[1..][0..len]) orelse return null;
+        const origin = batch.bytes[0];
+        batch.bytes = batch.bytes[1 + len ..];
+        return .{ .origin = origin, .readings = readings };
+    }
+
+    pub fn valid(bytes: []const u8) bool {
+        if (bytes.len == 0) return false;
+        var batch = ReadingBatch{ .bytes = bytes };
+        while (batch.next()) |_| {}
+        return batch.bytes.len == 0;
     }
 };
 
@@ -504,29 +535,29 @@ test "App packet round trip" {
 
 test "Root announcement round trip" {
     var buf: [RootAnnouncement.LEN]u8 = undefined;
-    (RootAnnouncement{ .root = 0xBEEF, .seq = 513, .hops = 4 }).write(&buf);
+    (RootAnnouncement{ .root = 0xBE, .seq = 513, .hops = 4 }).write(&buf);
 
     const ann = RootAnnouncement.parse(&buf).?;
-    try std.testing.expectEqual(@as(u16, 0xBEEF), ann.root);
+    try std.testing.expectEqual(@as(Address, 0xBE), ann.root);
     try std.testing.expectEqual(@as(u16, 513), ann.seq);
     try std.testing.expectEqual(@as(u8, 4), ann.hops);
-    try std.testing.expect(RootAnnouncement.parse(buf[0..4]) == null);
+    try std.testing.expect(RootAnnouncement.parse(buf[0..3]) == null);
 }
 
 test "Topology info round trip" {
     var buf: [32]u8 = undefined;
-    const bytes = try TopologyInfo.write(0x0102, 7, &.{ 0xBEEF, 3 }, &buf);
-    try std.testing.expectEqual(@as(usize, 9), bytes.len);
+    const bytes = try TopologyInfo.write(0x12, 7, &.{ 0xBE, 3 }, &buf);
+    try std.testing.expectEqual(@as(usize, 6), bytes.len);
 
     const info = TopologyInfo.parse(bytes).?;
-    try std.testing.expectEqual(@as(u16, 0x0102), info.origin);
+    try std.testing.expectEqual(@as(Address, 0x12), info.origin);
     try std.testing.expectEqual(@as(u16, 7), info.seq);
     try std.testing.expectEqual(@as(usize, 2), info.count());
-    try std.testing.expectEqual(@as(u16, 0xBEEF), info.neighbor(0));
-    try std.testing.expectEqual(@as(u16, 3), info.neighbor(1));
+    try std.testing.expectEqual(@as(Address, 0xBE), info.neighbor(0));
+    try std.testing.expectEqual(@as(Address, 3), info.neighbor(1));
 
-    try std.testing.expect(TopologyInfo.parse(bytes[0..8]) == null);
-    try std.testing.expectError(error.NoSpaceLeft, TopologyInfo.write(1, 1, &.{ 1, 2 }, buf[0..8]));
+    try std.testing.expect(TopologyInfo.parse(bytes[0..5]) == null);
+    try std.testing.expectError(error.NoSpaceLeft, TopologyInfo.write(1, 1, &.{ 1, 2 }, buf[0..5]));
 }
 
 test "Sensor writer round trips through the stream" {
@@ -600,6 +631,25 @@ test "Compact readings reject malformed payloads" {
     try std.testing.expect(CompactReadings.parse(&.{ 0x01, 0x00 }) == null);
     try std.testing.expect(CompactReadings.parse(&.{ 0x01, 0x00, 0x00, 0x00 }) == null);
     try std.testing.expect(CompactReadings.parse(&.{ 0x10, 0x00, 0x00 }) == null);
+}
+
+test "Reading batches walk every entry and reject trailing garbage" {
+    const bytes = [_]u8{ 4, 0x01, 0x09, 0xC4, 7, 0x05, 0xFB, 0x1E, 0x1F, 0x40 };
+    var batch = ReadingBatch{ .bytes = &bytes };
+
+    const first = batch.next().?;
+    try std.testing.expectEqual(@as(Address, 4), first.origin);
+    try std.testing.expectEqual(@as(?i16, 2500), first.readings.centi_celsius);
+
+    const second = batch.next().?;
+    try std.testing.expectEqual(@as(Address, 7), second.origin);
+    try std.testing.expectEqual(@as(?u16, 8000), second.readings.centi_pct);
+    try std.testing.expect(batch.next() == null);
+
+    try std.testing.expect(ReadingBatch.valid(&bytes));
+    try std.testing.expect(!ReadingBatch.valid(bytes[0..9]));
+    try std.testing.expect(!ReadingBatch.valid(&.{}));
+    try std.testing.expect(!ReadingBatch.valid(&.{ 4, 0x10, 0, 0 }));
 }
 
 test "Compact quantization clamps out of range values" {

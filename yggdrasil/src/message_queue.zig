@@ -55,6 +55,10 @@ pub fn txBuffer(mq: *MessageQueue, slot: usize) ?*NetworkPacket {
     return null;
 }
 
+pub fn queued(mq: *MessageQueue, slot: usize, i: usize) ?*NetworkPacket {
+    return mq.slots[slot].at(i);
+}
+
 pub fn ackTxBuffer(mq: *MessageQueue, slot: usize) void {
     mq.tx_buffers[slot] = null;
 }

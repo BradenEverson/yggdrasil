@@ -12,17 +12,17 @@ pub const lora = @import("lora.zig");
 pub const power = @import("power.zig");
 pub const Power = power.Power;
 pub const ForwardingTable = routing.ForwardingTable;
+pub const Address = NetworkPacket.Address;
 
 /// Errors that are common to most APIs and
 /// communication methods
 pub const YggdrasilError = error{ ReadFailed, WriteFailed };
-const LARGEST_PACKET_SIZE: usize = 240;
 
-/// Scratch space for serializing an outgoing packet: header + max payload + crc
+/// Scratch space for serializing an outgoing packet
 const TX_BUFFER_SIZE: usize = 256;
 
 comptime {
-    if (1 + AppPacket.TopologyInfo.HEADER_LEN + routing.MAX_NEIGHBORS * 2 > NetworkPacket.MAX_PAYLOAD_SIZE)
+    if (1 + AppPacket.TopologyInfo.HEADER_LEN + routing.MAX_NEIGHBORS > NetworkPacket.MAX_PAYLOAD_SIZE)
         @compileError("max_neighbors is too large for a full neighbor list to fit in one topology_info packet");
 }
 
@@ -30,8 +30,8 @@ pub const SendError = error{ NoRoute, PayloadTooLarge } || MessageQueue.PushErro
 pub const NeighborError = ForwardingTable.Error || error{AtCapacity};
 
 pub const RootRoute = struct {
-    addr: u16,
-    via: u16,
+    addr: Address,
+    via: Address,
     hops: u8,
     seq: u16,
     heard_at: u32,
@@ -39,75 +39,31 @@ pub const RootRoute = struct {
 
 const JoinCandidate = struct {
     ann: AppPacket.RootAnnouncement,
-    via: u16,
+    via: Address,
     hops: u8,
-};
-
-/// The states we can be in while reading
-/// from the incoming stream
-pub const ParseState = enum {
-    awaiting_header,
-
-    awaiting_from_msb,
-    awaiting_from_lsb,
-
-    awaiting_to_msb,
-    awaiting_to_lsb,
-
-    awaiting_origin_msb,
-    awaiting_origin_lsb,
-
-    awaiting_dest_msb,
-    awaiting_dest_lsb,
-
-    awaiting_ttl,
-
-    awaiting_flags,
-
-    awaiting_len,
-
-    awaiting_wake_hi,
-    awaiting_wake_mid,
-    awaiting_wake_lo,
-
-    awaiting_period_msb,
-    awaiting_period_lsb,
-
-    awaiting_hops,
-
-    reading_payload,
-
-    awaiting_crc_msb,
-    awaiting_crc_lsb,
 };
 
 /// The middleware struct between a high level app layer
 /// and whatever communication method there is at the
 /// physical level (UART, LoRa, whateva)
 pub const Yggdrasil = struct {
-    /// A non-blocking consume function that reads
-    /// whatever bytes are currently available from a
-    /// stream source (UART, LoRa, BLE, etc), possibly none
+    /// A non-blocking consume function that returns
+    /// one whole received frame, or an empty slice
+    /// when nothing has arrived
     read_bytes_fn: *const fn (buf: []u8) YggdrasilError![]u8,
     write_bytes_fn: *const fn (buf: []u8) YggdrasilError!void,
 
-    address: u16 = 0,
+    address: Address = 0,
 
     outgoing_packets: MessageQueue = .{},
     forwarding_table: ForwardingTable = .{},
 
-    state: ParseState = .awaiting_header,
-    cursor: usize = 0,
-
     buffer: []u8 = undefined,
-    packet_buffer: [LARGEST_PACKET_SIZE]u8 = undefined,
 
     result_cb: *const fn (packet: NetworkPacket) void,
 
-    building_packet: NetworkPacket = .{},
-
     clock: ?*const fn () u32 = null,
-    neighbor_lost_cb: ?*const fn (addr: u16) void = null,
+    neighbor_lost_cb: ?*const fn (addr: Address) void = null,
     retransmit_timeout_ms: u32 = 3000,
     retransmit_jitter_ms: u32 = 1000,
     max_retries: u8 = 8,
@@ -124,6 +80,7 @@ pub const Yggdrasil = struct {
     announce_at: u32 = 0,
 
     topology_flooding: bool = true,
+    merge_readings: bool = true,
     topology: routing.TopologyGraph = .{},
     topology_seq: u16 = 0,
     topology_timeout_ms: u32 = 0,
@@ -280,7 +237,7 @@ pub const Yggdrasil = struct {
     };
 
     fn frameLen(packet: *const NetworkPacket) usize {
-        return NetworkPacket.HEADER_LEN + packet.len + 2;
+        return packet.frameLen();
     }
 
     fn retransmitDelay(ygg: *Yggdrasil, len: usize) u32 {
@@ -415,8 +372,8 @@ pub const Yggdrasil = struct {
 
     fn stamp(ygg: *Yggdrasil, packet: *NetworkPacket) void {
         packet.hops = ygg.ownHops();
-        packet.wake_in = 0;
-        packet.period = 0;
+        packet.wake_phase = null;
+        packet.period = null;
 
         const p = ygg.power orelse return;
         if (!p.sleepy())
@@ -424,8 +381,14 @@ pub const Yggdrasil = struct {
 
         const now = ygg.currentTime();
         const next = ygg.ownWindowStart(now) +% p.periodMs();
-        packet.wake_in = @intCast(@min(next -% now, power.MAX_WAKE_IN));
-        packet.period = p.advertisedPeriod();
+        packet.wake_phase = NetworkPacket.wakePhase(next -% now, p.periodMs());
+        if (packet.broadcast or carriesPeriod(packet))
+            packet.period = p.advertisedPeriod();
+    }
+
+    fn carriesPeriod(packet: *const NetworkPacket) bool {
+        const app = AppPacket.parse(packet.body()) orelse return false;
+        return app.op == .hello or app.op == .im_a_root;
     }
 
     fn trafficLen(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, now: u32) ?usize {
@@ -517,14 +480,21 @@ pub const Yggdrasil = struct {
 
         neighbor.heard_at = now;
         neighbor.hops = packet.hops;
-        neighbor.sched_known = true;
 
         if (!to_us and !link_layer.isLinkOnly(packet))
             neighbor.busy_until = now +% p.backoffMs();
-        neighbor.period_ms = @as(u32, packet.period) * power.PERIOD_UNIT_MS;
-        if (neighbor.period_ms != 0) {
-            neighbor.next_window = now -% p.frameMs(frameLen(packet)) +% packet.wake_in;
-            neighbor.synced_at = now;
+
+        if (packet.wake_phase) |phase| {
+            if (packet.period) |period|
+                neighbor.period_ms = @as(u32, period) * power.PERIOD_UNIT_MS;
+            neighbor.sched_known = neighbor.period_ms != 0;
+            if (neighbor.sched_known) {
+                neighbor.next_window = now -% p.frameMs(frameLen(packet)) +% NetworkPacket.wakeInMs(phase, neighbor.period_ms);
+                neighbor.synced_at = now;
+            }
+        } else {
+            neighbor.period_ms = 0;
+            neighbor.sched_known = true;
         }
 
         if (ygg.root) |current| {
@@ -612,7 +582,7 @@ pub const Yggdrasil = struct {
         return .{ .root = current.addr, .seq = current.seq, .hops = current.hops };
     }
 
-    fn markAnnounce(ygg: *Yggdrasil, except: ?u16, hops: u8) void {
+    fn markAnnounce(ygg: *Yggdrasil, except: ?Address, hops: u8) void {
         const ft = &ygg.forwarding_table;
         for (ft.output_map[0..ft.num_registered_output_map]) |*neighbor| {
             if (except != null and neighbor.addr == except.?)
@@ -622,7 +592,7 @@ pub const Yggdrasil = struct {
         }
     }
 
-    fn directPacket(ygg: *const Yggdrasil, to: u16, op: AppPacket.Opcode) NetworkPacket {
+    fn directPacket(ygg: *const Yggdrasil, to: Address, op: AppPacket.Opcode) NetworkPacket {
         var packet = NetworkPacket{
             .from = ygg.address,
             .to = to,
@@ -790,7 +760,7 @@ pub const Yggdrasil = struct {
             return;
 
         const ft = &ygg.forwarding_table;
-        var own: [routing.MAX_NEIGHBORS]u16 = undefined;
+        var own: [routing.MAX_NEIGHBORS]Address = undefined;
         for (ft.output_map[0..ft.num_registered_output_map], 0..) |n, i| own[i] = n.addr;
 
         var buf: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
@@ -809,7 +779,7 @@ pub const Yggdrasil = struct {
             return;
 
         const ft = &ygg.forwarding_table;
-        const via: ?u16 = if (ygg.root) |r| r.via else null;
+        const via: ?Address = if (ygg.root) |r| r.via else null;
         var i = ft.num_registered_output_map;
         while (i > 0) {
             i -= 1;
@@ -824,7 +794,7 @@ pub const Yggdrasil = struct {
         }
     }
 
-    fn helloHeard(ygg: *Yggdrasil, addr: u16) void {
+    fn helloHeard(ygg: *Yggdrasil, addr: Address) void {
         const p = ygg.power.?;
         const known = ygg.forwarding_table.neighborByAddr(addr) != null;
         const neighbor = ygg.learnNeighbor(addr) catch return;
@@ -917,7 +887,7 @@ pub const Yggdrasil = struct {
         }
     }
 
-    pub fn dropNeighbor(ygg: *Yggdrasil, addr: u16) void {
+    pub fn dropNeighbor(ygg: *Yggdrasil, addr: Address) void {
         const neighbor = ygg.forwarding_table.neighborByAddr(addr) orelse return;
 
         ygg.outgoing_packets.clearSlot(neighbor.mq_idx);
@@ -937,14 +907,13 @@ pub const Yggdrasil = struct {
     fn writePacket(ygg: *Yggdrasil, packet: *NetworkPacket) YggdrasilError!void {
         var buf: [TX_BUFFER_SIZE]u8 = undefined;
         ygg.stamp(packet);
-        packet.crc = null;
         try ygg.write_bytes_fn(packet.toBuffer(&buf));
 
         if (ygg.power) |p|
             ygg.stayAwake(ygg.currentTime() +% p.lingerMs(frameLen(packet)));
     }
 
-    pub fn registerNeighbor(ygg: *Yggdrasil, addr: u16, slot: usize) NeighborError!*routing.MessageQueueMap {
+    pub fn registerNeighbor(ygg: *Yggdrasil, addr: Address, slot: usize) NeighborError!*routing.MessageQueueMap {
         const known = ygg.forwarding_table.neighborByAddr(addr) != null;
         const neighbor = try ygg.forwarding_table.registerNeighbor(addr, slot);
 
@@ -1017,7 +986,7 @@ pub const Yggdrasil = struct {
             ygg.own_flood_pending = false;
 
             const ft = &ygg.forwarding_table;
-            var own: [routing.MAX_NEIGHBORS]u16 = undefined;
+            var own: [routing.MAX_NEIGHBORS]Address = undefined;
             for (ft.output_map[0..ft.num_registered_output_map], 0..) |n, i| own[i] = n.addr;
 
             return ygg.topologyPacket(ygg.address, ygg.topology_seq, own[0..ft.num_registered_output_map]);
@@ -1034,7 +1003,7 @@ pub const Yggdrasil = struct {
         return null;
     }
 
-    fn topologyPacket(ygg: *const Yggdrasil, origin: u16, seq: u16, neighbors: []const u16) NetworkPacket {
+    fn topologyPacket(ygg: *const Yggdrasil, origin: Address, seq: u16, neighbors: []const Address) NetworkPacket {
         var packet = NetworkPacket{
             .from = ygg.address,
             .to = NetworkPacket.BROADCAST_ADDR,
@@ -1052,7 +1021,7 @@ pub const Yggdrasil = struct {
         return ygg.topology_flooding or (ygg.topology_reporting and ygg.is_root);
     }
 
-    fn handleTopologyInfo(ygg: *Yggdrasil, from: u16, payload: []const u8) void {
+    fn handleTopologyInfo(ygg: *Yggdrasil, from: Address, payload: []const u8) void {
         if (!ygg.keepsTopology())
             return;
 
@@ -1067,7 +1036,7 @@ pub const Yggdrasil = struct {
             return;
         }
 
-        var neighbors: [routing.MAX_NEIGHBORS]u16 = undefined;
+        var neighbors: [routing.MAX_NEIGHBORS]Address = undefined;
         const n = @min(info.count(), neighbors.len);
         for (0..n) |i| neighbors[i] = info.neighbor(i);
 
@@ -1104,10 +1073,10 @@ pub const Yggdrasil = struct {
             return;
 
         const ft = &ygg.forwarding_table;
-        const root_addr: ?u16 = if (ygg.root) |r| r.addr else null;
+        const root_addr: ?Address = if (ygg.root) |r| r.addr else null;
         ft.removeRoutesExcept(root_addr);
 
-        var own: [routing.MAX_NEIGHBORS]u16 = undefined;
+        var own: [routing.MAX_NEIGHBORS]Address = undefined;
         for (ft.output_map[0..ft.num_registered_output_map], 0..) |n, i| own[i] = n.addr;
 
         var paths: [routing.TopologyGraph.MAX_VERTICES]routing.Path = undefined;
@@ -1125,7 +1094,7 @@ pub const Yggdrasil = struct {
             ygg.forwarding_table.num_registered_output_map >= ygg.max_children;
     }
 
-    pub fn learnNeighbor(ygg: *Yggdrasil, addr: u16) NeighborError!*routing.MessageQueueMap {
+    pub fn learnNeighbor(ygg: *Yggdrasil, addr: Address) NeighborError!*routing.MessageQueueMap {
         const ft = &ygg.forwarding_table;
 
         if (ft.neighborByAddr(addr)) |existing|
@@ -1138,7 +1107,7 @@ pub const Yggdrasil = struct {
         return ygg.registerNeighbor(addr, slot);
     }
 
-    pub fn send(ygg: *Yggdrasil, dest: u16, payload: []const u8, priority: u8) SendError!void {
+    pub fn send(ygg: *Yggdrasil, dest: Address, payload: []const u8, priority: u8) SendError!void {
         const found = ygg.routeTo(dest) orelse return error.NoRoute;
 
         var packet = NetworkPacket{
@@ -1150,10 +1119,79 @@ pub const Yggdrasil = struct {
         };
         try packet.setPayload(payload);
 
-        try ygg.outgoing_packets.pushMessage(found.neighbor.mq_idx, packet, priority);
+        try ygg.enqueue(found.neighbor, packet, priority);
     }
 
-    fn routeTo(ygg: *Yggdrasil, dest: u16) ?routing.Route {
+    fn enqueue(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, packet: NetworkPacket, priority: u8) MessageQueue.PushError!void {
+        if (ygg.merge_readings and ygg.mergeQueued(neighbor, &packet))
+            return;
+        try ygg.outgoing_packets.pushMessage(neighbor.mq_idx, packet, priority);
+    }
+
+    fn mergeQueued(ygg: *Yggdrasil, neighbor: *routing.MessageQueueMap, incoming: *const NetworkPacket) bool {
+        if (incoming.broadcast)
+            return false;
+
+        const mq = &ygg.outgoing_packets;
+        if (!neighbor.sent) {
+            if (mq.tx_buffers[neighbor.mq_idx]) |*held| {
+                if (ygg.mergeReadings(held, incoming))
+                    return true;
+            }
+        }
+
+        var i: usize = 0;
+        while (mq.queued(neighbor.mq_idx, i)) |waiting| : (i += 1) {
+            if (ygg.mergeReadings(waiting, incoming))
+                return true;
+        }
+        return false;
+    }
+
+    fn mergeReadings(ygg: *const Yggdrasil, target: *NetworkPacket, incoming: *const NetworkPacket) bool {
+        if (target.broadcast or target.dest != incoming.dest)
+            return false;
+
+        var held_buf: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
+        var new_buf: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
+        const held = readingEntries(target, &held_buf) orelse return false;
+        const new = readingEntries(incoming, &new_buf) orelse return false;
+
+        const len = 1 + held.len + new.len;
+        if (len > NetworkPacket.MAX_PAYLOAD_SIZE)
+            return false;
+
+        var out: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
+        out[0] = @backingInt(AppPacket.Opcode.batched_readings);
+        @memcpy(out[1..][0..held.len], held);
+        @memcpy(out[1 + held.len ..][0..new.len], new);
+
+        target.setPayload(out[0..len]) catch return false;
+        target.origin = ygg.address;
+        target.ttl = @max(target.ttl, incoming.ttl);
+        return true;
+    }
+
+    fn readingEntries(packet: *const NetworkPacket, buf: []u8) ?[]const u8 {
+        const app = AppPacket.parse(packet.body()) orelse return null;
+        switch (app.op) {
+            .compact_readings => {
+                _ = AppPacket.CompactReadings.parse(app.payload) orelse return null;
+                buf[0] = packet.origin;
+                @memcpy(buf[1..][0..app.payload.len], app.payload);
+                return buf[0 .. 1 + app.payload.len];
+            },
+            .batched_readings => {
+                if (!AppPacket.ReadingBatch.valid(app.payload))
+                    return null;
+                @memcpy(buf[0..app.payload.len], app.payload);
+                return buf[0..app.payload.len];
+            },
+            else => return null,
+        }
+    }
+
+    fn routeTo(ygg: *Yggdrasil, dest: Address) ?routing.Route {
         if (ygg.root) |current| {
             if (current.addr == dest and current.via != dest) {
                 if (ygg.forwarding_table.neighborByAddr(current.via)) |via|
@@ -1163,7 +1201,7 @@ pub const Yggdrasil = struct {
         return ygg.forwarding_table.route(dest);
     }
 
-    pub fn rootAddress(ygg: *const Yggdrasil) ?u16 {
+    pub fn rootAddress(ygg: *const Yggdrasil) ?Address {
         if (ygg.is_root)
             return ygg.address;
 
@@ -1225,7 +1263,7 @@ pub const Yggdrasil = struct {
         ygg.queueAnnouncement(ann, ygg.currentTime() +% ygg.random(ygg.announce_jitter_ms));
     }
 
-    fn handleRootAnnouncement(ygg: *Yggdrasil, from: u16, payload: []const u8) void {
+    fn handleRootAnnouncement(ygg: *Yggdrasil, from: Address, payload: []const u8) void {
         if (ygg.is_root)
             return;
 
@@ -1277,7 +1315,7 @@ pub const Yggdrasil = struct {
         return ann.seq == best.ann.seq and hops < best.hops;
     }
 
-    fn considerCandidate(ygg: *Yggdrasil, ann: AppPacket.RootAnnouncement, via: u16, hops: u8) void {
+    fn considerCandidate(ygg: *Yggdrasil, ann: AppPacket.RootAnnouncement, via: Address, hops: u8) void {
         if (ygg.join_candidate) |best| {
             if (!betterRoot(best, ann, hops))
                 return;
@@ -1330,7 +1368,7 @@ pub const Yggdrasil = struct {
         ygg.recomputeRoutes();
     }
 
-    fn refreshDirectRoot(ygg: *Yggdrasil, from: u16) void {
+    fn refreshDirectRoot(ygg: *Yggdrasil, from: Address) void {
         if (ygg.root) |*current| {
             if (current.addr == from and current.via == from)
                 current.heard_at = ygg.currentTime();
@@ -1348,7 +1386,7 @@ pub const Yggdrasil = struct {
         ygg.loseRoot(at);
     }
 
-    pub fn sendApp(ygg: *Yggdrasil, dest: u16, app: AppPacket, priority: u8) SendError!void {
+    pub fn sendApp(ygg: *Yggdrasil, dest: Address, app: AppPacket, priority: u8) SendError!void {
         var buf: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
         const bytes = app.write(&buf) catch return error.PayloadTooLarge;
         try ygg.send(dest, bytes, priority);
@@ -1380,7 +1418,7 @@ pub const Yggdrasil = struct {
         neighbor.retries = 0;
     }
 
-    fn replyHello(ygg: *Yggdrasil, addr: u16) (NeighborError || SendError)!void {
+    fn replyHello(ygg: *Yggdrasil, addr: Address) (NeighborError || SendError)!void {
         const known = ygg.forwarding_table.neighborByAddr(addr) != null;
         const neighbor = try ygg.learnNeighbor(addr);
 
@@ -1416,9 +1454,8 @@ pub const Yggdrasil = struct {
         forwarded.from = ygg.address;
         forwarded.to = hop.addr;
         forwarded.ttl = packet.ttl - 1;
-        forwarded.crc = null;
 
-        ygg.outgoing_packets.pushMessage(hop.mq_idx, forwarded, MessageQueue.PRIORITY_LOW) catch {};
+        ygg.enqueue(hop, forwarded, MessageQueue.PRIORITY_LOW) catch {};
     }
 
     fn handleBroadcast(ygg: *Yggdrasil, packet: NetworkPacket) void {
@@ -1488,148 +1525,15 @@ pub const Yggdrasil = struct {
         }
     }
 
-    /// Superloop that will constantly poll the provided read function and feed it to
-    /// a state machine for parsing out Yggdrasil packets. Performs a quick verification
-    /// of the CRC, and if successful passes the message to the callback :D
     pub fn readStream(ygg: *Yggdrasil) YggdrasilError!void {
-        const bytes = try ygg.read_bytes_fn(ygg.buffer);
-
-        for (bytes) |byte| {
-            if (ygg.readByte(byte)) |packet| {
-                if (NetworkPacket.CRC.validateCRC(
-                    ygg.packet_buffer[0 .. ygg.building_packet.len + NetworkPacket.HEADER_LEN],
-                    ygg.building_packet.crc.?,
-                )) {
-                    ygg.handle_network_packet(packet);
-                } else {
-                    // TODO!!!!!!!!!!!!
-                    // Call error callback!
-                    //
-                    // The application from here can
-                    // choose to send a nack, shouldn't
-                    // be our decision here
-                }
-            }
-        }
+        const frame = try ygg.read_bytes_fn(ygg.buffer);
+        if (frame.len != 0)
+            ygg.handleFrame(frame);
     }
 
-    pub fn readByte(ygg: *Yggdrasil, byte: u8) ?NetworkPacket {
-        ygg.packet_buffer[ygg.cursor] = byte;
-        ygg.cursor += 1;
-
-        switch (ygg.state) {
-            .awaiting_header => {
-                if (byte == NetworkPacket.HEADER) {
-                    ygg.state = .awaiting_from_msb;
-                } else {
-                    ygg.cursor = 0;
-                }
-            },
-
-            .awaiting_from_msb => {
-                ygg.building_packet.from = @as(u16, byte) << 8;
-                ygg.state = .awaiting_from_lsb;
-            },
-            .awaiting_from_lsb => {
-                ygg.building_packet.from |= byte;
-                ygg.state = .awaiting_to_msb;
-            },
-
-            .awaiting_to_msb => {
-                ygg.building_packet.to = @as(u16, byte) << 8;
-                ygg.state = .awaiting_to_lsb;
-            },
-            .awaiting_to_lsb => {
-                ygg.building_packet.to |= byte;
-                ygg.state = .awaiting_origin_msb;
-            },
-
-            .awaiting_origin_msb => {
-                ygg.building_packet.origin = @as(u16, byte) << 8;
-                ygg.state = .awaiting_origin_lsb;
-            },
-            .awaiting_origin_lsb => {
-                ygg.building_packet.origin |= byte;
-                ygg.state = .awaiting_dest_msb;
-            },
-
-            .awaiting_dest_msb => {
-                ygg.building_packet.dest = @as(u16, byte) << 8;
-                ygg.state = .awaiting_dest_lsb;
-            },
-            .awaiting_dest_lsb => {
-                ygg.building_packet.dest |= byte;
-                ygg.state = .awaiting_ttl;
-            },
-
-            .awaiting_ttl => {
-                ygg.building_packet.ttl = byte;
-                ygg.state = .awaiting_flags;
-            },
-
-            .awaiting_flags => {
-                ygg.building_packet.parseFlags(byte);
-                ygg.state = .awaiting_len;
-            },
-
-            .awaiting_len => {
-                ygg.building_packet.len = byte;
-
-                if (byte > NetworkPacket.MAX_PAYLOAD_SIZE) {
-                    ygg.state = .awaiting_header;
-                    ygg.cursor = 0;
-                } else {
-                    ygg.state = .awaiting_wake_hi;
-                }
-            },
-
-            .awaiting_wake_hi => {
-                ygg.building_packet.wake_in = @as(u24, byte) << 16;
-                ygg.state = .awaiting_wake_mid;
-            },
-            .awaiting_wake_mid => {
-                ygg.building_packet.wake_in |= @as(u24, byte) << 8;
-                ygg.state = .awaiting_wake_lo;
-            },
-            .awaiting_wake_lo => {
-                ygg.building_packet.wake_in |= byte;
-                ygg.state = .awaiting_period_msb;
-            },
-
-            .awaiting_period_msb => {
-                ygg.building_packet.period = @as(u16, byte) << 8;
-                ygg.state = .awaiting_period_lsb;
-            },
-            .awaiting_period_lsb => {
-                ygg.building_packet.period |= byte;
-                ygg.state = .awaiting_hops;
-            },
-
-            .awaiting_hops => {
-                ygg.building_packet.hops = byte;
-                ygg.state = if (ygg.building_packet.len == 0) .awaiting_crc_msb else .reading_payload;
-            },
-            .reading_payload => {
-                ygg.building_packet.payload[ygg.cursor - NetworkPacket.HEADER_LEN - 1] = byte;
-                if (ygg.cursor == ygg.building_packet.len + NetworkPacket.HEADER_LEN) {
-                    ygg.state = .awaiting_crc_msb;
-                }
-            },
-
-            .awaiting_crc_msb => {
-                ygg.building_packet.crc = @as(u16, byte) << 8;
-                ygg.state = .awaiting_crc_lsb;
-            },
-            .awaiting_crc_lsb => {
-                ygg.building_packet.crc.? |= byte;
-
-                ygg.state = .awaiting_header;
-                ygg.cursor = 0;
-                return ygg.building_packet;
-            },
-        }
-
-        return null;
+    pub fn handleFrame(ygg: *Yggdrasil, frame: []const u8) void {
+        const packet = NetworkPacket.parse(frame) orelse return;
+        ygg.handle_network_packet(packet);
     }
 };
 
@@ -1686,7 +1590,7 @@ const TestNet = struct {
         delivered = packet;
     }
 
-    fn node(addr: u16) Yggdrasil {
+    fn node(addr: Address) Yggdrasil {
         return .{
             .read_bytes_fn = read,
             .write_bytes_fn = write,
@@ -1697,15 +1601,8 @@ const TestNet = struct {
     }
 
     fn hear(ygg: *Yggdrasil) !void {
-        for (wire[0..wire_len]) |byte| {
-            if (ygg.readByte(byte)) |packet| {
-                try std.testing.expect(NetworkPacket.CRC.validateCRC(
-                    ygg.packet_buffer[0 .. packet.len + NetworkPacket.HEADER_LEN],
-                    packet.crc.?,
-                ));
-                ygg.handle_network_packet(packet);
-            }
-        }
+        try std.testing.expect(NetworkPacket.parse(wire[0..wire_len]) != null);
+        ygg.handleFrame(wire[0..wire_len]);
     }
 
     fn transmit(from: *Yggdrasil, listeners: []const *Yggdrasil) !void {
@@ -1771,9 +1668,9 @@ test "packets are forwarded across hops with origin preserved" {
     try TestNet.transmit(&b, &.{ &a, &c });
 
     const got = TestNet.delivered.?;
-    try std.testing.expectEqual(@as(u16, 1), got.origin);
-    try std.testing.expectEqual(@as(u16, 3), got.dest);
-    try std.testing.expectEqual(@as(u16, 2), got.from);
+    try std.testing.expectEqual(@as(Address, 1), got.origin);
+    try std.testing.expectEqual(@as(Address, 3), got.dest);
+    try std.testing.expectEqual(@as(Address, 2), got.from);
     try std.testing.expectEqualSlices(u8, "hi", got.body());
 
     try TestNet.transmit(&c, &.{&b});
@@ -1784,17 +1681,17 @@ test "packets are forwarded across hops with origin preserved" {
 
 const TestClock = struct {
     var time: u32 = 0;
-    var lost: ?u16 = null;
+    var lost: ?Address = null;
 
     fn now() u32 {
         return time;
     }
 
-    fn onLost(addr: u16) void {
+    fn onLost(addr: Address) void {
         lost = addr;
     }
 
-    fn node(addr: u16) Yggdrasil {
+    fn node(addr: Address) Yggdrasil {
         var ygg = TestNet.node(addr);
         ygg.clock = now;
         ygg.neighbor_lost_cb = onLost;
@@ -1818,7 +1715,8 @@ test "max size packets fit the radio and parse" {
     TestNet.delivered = null;
     try TestNet.transmit(&a, &.{&b});
 
-    try std.testing.expectEqual(LARGEST_PACKET_SIZE, TestNet.wire_len);
+    try std.testing.expectEqual(NetworkPacket.BASE_HEADER_LEN + NetworkPacket.MAX_PAYLOAD_SIZE, TestNet.wire_len);
+    try std.testing.expect(NetworkPacket.MAX_HEADER_LEN + NetworkPacket.MAX_PAYLOAD_SIZE <= NetworkPacket.MAX_FRAME_LEN);
     try std.testing.expectEqualSlices(u8, &payload, TestNet.delivered.?.body());
     try std.testing.expectError(error.PayloadTooLarge, a.send(2, &(payload ++ [_]u8{0}), MessageQueue.PRIORITY_LOW));
 }
@@ -1849,7 +1747,7 @@ test "retransmits wait for the timer and unresponsive neighbors are dropped" {
 
     TestClock.time = 330;
     try std.testing.expect(!try a.requestWrite());
-    try std.testing.expectEqual(@as(?u16, 2), TestClock.lost);
+    try std.testing.expectEqual(@as(?Address, 2), TestClock.lost);
     try std.testing.expect(a.forwarding_table.nextHop(2) == null);
     try std.testing.expect(a.forwarding_table.nextHop(3) == null);
     try std.testing.expect(a.outgoing_packets.allEmpty());
@@ -1871,7 +1769,7 @@ test "acked packets stop retransmitting and acks skip the timer" {
     try TestNet.transmit(&b, &.{&a});
 
     try TestNet.transmit(&a, &.{&b});
-    try std.testing.expectEqual(NetworkPacket.HEADER_LEN + 2, TestNet.wire_len);
+    try std.testing.expectEqual(NetworkPacket.BASE_HEADER_LEN, TestNet.wire_len);
     try std.testing.expect(b.outgoing_packets.allEmpty());
     try std.testing.expect(!a.outgoing_packets.allEmpty());
 
@@ -1889,7 +1787,7 @@ test "acked packets stop retransmitting and acks skip the timer" {
     try std.testing.expect(TestClock.lost == null);
 }
 
-fn announcementFrom(ygg: *Yggdrasil, root: u16, seq: u16, hops: u8) void {
+fn announcementFrom(ygg: *Yggdrasil, root: Address, seq: u16, hops: u8) void {
     ygg.queueAnnouncement(.{ .root = root, .seq = seq, .hops = hops }, 0);
 }
 
@@ -1903,15 +1801,15 @@ test "root announcements build routes across hops and set ttl from them" {
     a.announceRoot();
     try TestNet.transmit(&a, &.{&b});
 
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
     try std.testing.expectEqual(@as(u8, 1), b.root.?.hops);
     try std.testing.expect(c.rootAddress() == null);
 
     try TestNet.transmit(&b, &.{ &a, &c });
 
-    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), c.rootAddress());
     try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
-    try std.testing.expectEqual(@as(u16, 2), c.root.?.via);
+    try std.testing.expectEqual(@as(Address, 2), c.root.?.via);
     try std.testing.expect(a.root == null);
 
     try TestNet.transmit(&c, &.{&b});
@@ -1927,17 +1825,17 @@ test "root announcements build routes across hops and set ttl from them" {
     try TestNet.transmit(&b, &.{&a});
 
     const got = TestNet.delivered.?;
-    try std.testing.expectEqual(@as(u16, 3), got.origin);
-    try std.testing.expectEqual(@as(u16, 1), got.dest);
+    try std.testing.expectEqual(@as(Address, 3), got.origin);
+    try std.testing.expectEqual(@as(Address, 1), got.dest);
     try std.testing.expectEqual(@as(u8, 1), got.ttl);
     try std.testing.expectEqualSlices(u8, "r", got.body());
 }
 
 const Mesh = struct {
     nodes: []const *Yggdrasil,
-    links: []const [2]u16,
+    links: []const [2]Address,
 
-    fn hears(mesh: Mesh, a: u16, b: u16) bool {
+    fn hears(mesh: Mesh, a: Address, b: Address) bool {
         for (mesh.links) |l| {
             if ((l[0] == a and l[1] == b) or (l[0] == b and l[1] == a)) return true;
         }
@@ -1976,7 +1874,7 @@ const Mesh = struct {
     }
 };
 
-fn meshNode(addr: u16) Yggdrasil {
+fn meshNode(addr: Address) Yggdrasil {
     var ygg = TestNet.node(addr);
     ygg.topology_flooding = true;
     return ygg;
@@ -1995,27 +1893,27 @@ test "link-state flooding gives every node routes across the mesh" {
     for (mesh.nodes) |n| try mesh.hello(n);
     try mesh.settle();
 
-    try std.testing.expectEqual(@as(u16, 2), n1.forwarding_table.route(4).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 2), n1.forwarding_table.route(4).?.neighbor.addr);
     try std.testing.expectEqual(@as(u8, 3), n1.forwarding_table.route(4).?.hops);
     try std.testing.expectEqual(@as(u8, 2), n1.forwarding_table.route(3).?.hops);
-    try std.testing.expectEqual(@as(u16, 3), n4.forwarding_table.route(1).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 3), n4.forwarding_table.route(1).?.neighbor.addr);
     try std.testing.expectEqual(@as(u8, 3), n4.forwarding_table.route(1).?.hops);
-    try std.testing.expectEqual(@as(u16, 3), n2.forwarding_table.route(4).?.neighbor.addr);
-    try std.testing.expectEqual(@as(u16, 2), n3.forwarding_table.route(1).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 3), n2.forwarding_table.route(4).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 2), n3.forwarding_table.route(1).?.neighbor.addr);
 
     TestNet.delivered = null;
     try n1.send(4, "far", MessageQueue.PRIORITY_LOW);
     try mesh.settle();
 
     const got = TestNet.delivered.?;
-    try std.testing.expectEqual(@as(u16, 1), got.origin);
-    try std.testing.expectEqual(@as(u16, 4), got.dest);
+    try std.testing.expectEqual(@as(Address, 1), got.origin);
+    try std.testing.expectEqual(@as(Address, 4), got.dest);
     try std.testing.expectEqualSlices(u8, "far", got.body());
 
     TestNet.delivered = null;
     try n4.send(1, "back", MessageQueue.PRIORITY_LOW);
     try mesh.settle();
-    try std.testing.expectEqual(@as(u16, 1), TestNet.delivered.?.dest);
+    try std.testing.expectEqual(@as(Address, 1), TestNet.delivered.?.dest);
     try std.testing.expectEqualSlices(u8, "back", TestNet.delivered.?.body());
 }
 
@@ -2033,22 +1931,22 @@ test "routes move to the next shortest path when a link breaks" {
     for (mesh.nodes) |n| try mesh.hello(n);
     try mesh.settle();
 
-    try std.testing.expectEqual(@as(u16, 2), n1.forwarding_table.route(3).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 2), n1.forwarding_table.route(3).?.neighbor.addr);
     try std.testing.expectEqual(@as(u8, 2), n1.forwarding_table.route(3).?.hops);
 
     mesh.links = &.{ .{ 1, 2 }, .{ 1, 4 }, .{ 4, 5 }, .{ 5, 3 } };
     mesh.cut(&n2, &n3);
     try mesh.settle();
 
-    try std.testing.expectEqual(@as(u16, 4), n1.forwarding_table.route(3).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 4), n1.forwarding_table.route(3).?.neighbor.addr);
     try std.testing.expectEqual(@as(u8, 3), n1.forwarding_table.route(3).?.hops);
-    try std.testing.expectEqual(@as(u16, 1), n2.forwarding_table.route(3).?.neighbor.addr);
+    try std.testing.expectEqual(@as(Address, 1), n2.forwarding_table.route(3).?.neighbor.addr);
     try std.testing.expectEqual(@as(u8, 4), n2.forwarding_table.route(3).?.hops);
 
     TestNet.delivered = null;
     try n2.send(3, "around", MessageQueue.PRIORITY_LOW);
     try mesh.settle();
-    try std.testing.expectEqual(@as(u16, 3), TestNet.delivered.?.dest);
+    try std.testing.expectEqual(@as(Address, 3), TestNet.delivered.?.dest);
     try std.testing.expectEqualSlices(u8, "around", TestNet.delivered.?.body());
 }
 
@@ -2106,25 +2004,25 @@ test "newer sequence numbers win, shorter paths win within a sequence" {
     announcementFrom(&a, 1, 5, 3);
     try TestNet.transmit(&a, &.{&c});
     try std.testing.expectEqual(@as(u8, 4), c.root.?.hops);
-    try std.testing.expectEqual(@as(u16, 10), c.root.?.via);
+    try std.testing.expectEqual(@as(Address, 10), c.root.?.via);
 
     announcementFrom(&b, 1, 5, 1);
     try TestNet.transmit(&b, &.{&c});
     try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
-    try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
+    try std.testing.expectEqual(@as(Address, 20), c.root.?.via);
 
     announcementFrom(&a, 1, 5, 0);
     try TestNet.transmit(&a, &.{&c});
     try std.testing.expectEqual(@as(u8, 1), c.root.?.hops);
-    try std.testing.expectEqual(@as(u16, 10), c.forwarding_table.nextHop(1).?.addr);
+    try std.testing.expectEqual(@as(Address, 10), c.forwarding_table.nextHop(1).?.addr);
 
     announcementFrom(&b, 1, 4, 0);
     try TestNet.transmit(&b, &.{&c});
-    try std.testing.expectEqual(@as(u16, 10), c.root.?.via);
+    try std.testing.expectEqual(@as(Address, 10), c.root.?.via);
 
     announcementFrom(&b, 1, 6, 7);
     try TestNet.transmit(&b, &.{&c});
-    try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
+    try std.testing.expectEqual(@as(Address, 20), c.root.?.via);
     try std.testing.expectEqual(@as(u8, 8), c.root.?.hops);
     try std.testing.expectEqual(@as(u8, 8), c.forwarding_table.route(1).?.hops);
 }
@@ -2139,7 +2037,7 @@ test "any frame from a direct root keeps it alive" {
 
     a.announceRoot();
     try TestNet.transmit(&a, &.{&b});
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
 
     TestClock.time = 900;
     try a.sayHello();
@@ -2147,7 +2045,7 @@ test "any frame from a direct root keeps it alive" {
 
     TestClock.time = 1800;
     _ = try b.requestWrite();
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
 
     TestClock.time = 1900;
     _ = try b.requestWrite();
@@ -2164,7 +2062,7 @@ test "hello is answered with a root announcement" {
 
     a.announceRoot();
     try TestNet.transmit(&a, &.{&b});
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
     b.pending_announce = null;
 
     try c.sayHello();
@@ -2173,7 +2071,7 @@ test "hello is answered with a root announcement" {
 
     TestClock.time = b.announce_at;
     try TestNet.transmit(&b, &.{&c});
-    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), c.rootAddress());
     try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
 }
 
@@ -2187,11 +2085,11 @@ test "root routes expire without fresh announcements" {
 
     a.announceRoot();
     try TestNet.transmit(&a, &.{&b});
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
 
     TestClock.time = 999;
     _ = try b.requestWrite();
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
 
     TestClock.time = 1000;
     _ = try b.requestWrite();
@@ -2239,8 +2137,8 @@ test "joiners keep the shortest root offered during a scan" {
 
     TestClock.time = 5000;
     _ = try c.requestWrite();
-    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
-    try std.testing.expectEqual(@as(u16, 20), c.root.?.via);
+    try std.testing.expectEqual(@as(?Address, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(Address, 20), c.root.?.via);
     try std.testing.expectEqual(@as(u8, 2), c.root.?.hops);
     try std.testing.expect(c.joining_until == null);
     try std.testing.expect(c.join_candidate == null);
@@ -2256,7 +2154,7 @@ test "joiners adopt a direct root without waiting for the scan to end" {
 
     announcementFrom(&a, 1, 5, 0);
     try TestNet.transmit(&a, &.{&c});
-    try std.testing.expectEqual(@as(?u16, 1), c.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), c.rootAddress());
     try std.testing.expectEqual(@as(u8, 1), c.root.?.hops);
     try std.testing.expect(c.joining_until == null);
 }
@@ -2304,10 +2202,10 @@ test "a unicast send keeps the radio quiet until its ack can come back" {
     n.root = .{ .addr = 1, .via = 1, .hops = 1, .seq = 1, .heard_at = 0 };
     try n.forwarding_table.setRoute(1, parent.mq_idx, 1);
     const p = n.power.?;
-    const wait = p.frameMs(NetworkPacket.HEADER_LEN + 1 + 2) + p.backoffMs();
 
     try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
     try std.testing.expect(try n.requestWrite());
+    const wait = p.frameMs(TestNet.wire_len) + p.backoffMs();
 
     n.queueAnnouncement(.{ .root = 1, .seq = 1, .hops = 1 }, 0);
     try std.testing.expect(!try n.requestWrite());
@@ -2343,7 +2241,7 @@ test "a neighbor overheard sending to someone else is left alone until its ack i
     try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
     const p = n.power.?;
 
-    var overheard = NetworkPacket{ .from = 2, .to = 1, .origin = 2, .dest = 1, .len = 1, .period = 600, .wake_in = 30_000, .hops = 1 };
+    var overheard = NetworkPacket{ .from = 2, .to = 1, .origin = 2, .dest = 1, .len = 1, .period = 600, .wake_phase = NetworkPacket.wakePhase(30_000, 60_000), .hops = 1 };
     overheard.payload[0] = 'y';
     n.handle_network_packet(overheard);
 
@@ -2364,7 +2262,7 @@ test "rooted sleepy nodes beacon right after their own window every few periods"
 
     announcementFrom(&a, 1, 5, 0);
     try TestNet.transmit(&a, &.{&b});
-    try std.testing.expectEqual(@as(?u16, 1), b.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), b.rootAddress());
 
     const p = b.power.?;
     var beacons: usize = 0;
@@ -2392,17 +2290,17 @@ const Air = struct {
     const Frame = struct {
         bytes: [TX_BUFFER_SIZE]u8,
         len: usize,
-        from: u16,
+        from: Address,
         at: u32,
     };
 
     nodes: []const *Yggdrasil,
-    links: []const [2]u16,
+    links: []const [2]Address,
     sample_ms: u32 = 0,
     frames: [64]Frame = undefined,
     num_frames: usize = 0,
 
-    fn hears(air: *const Air, a: u16, b: u16) bool {
+    fn hears(air: *const Air, a: Address, b: Address) bool {
         for (air.links) |l| {
             if ((l[0] == a and l[1] == b) or (l[0] == b and l[1] == a)) return true;
         }
@@ -2410,9 +2308,7 @@ const Air = struct {
     }
 
     fn deliver(ygg: *Yggdrasil, bytes: []const u8) void {
-        for (bytes) |byte| {
-            if (ygg.readByte(byte)) |packet| ygg.handle_network_packet(packet);
-        }
+        ygg.handleFrame(bytes);
     }
 
     fn step(air: *Air) !void {
@@ -2465,7 +2361,7 @@ const Air = struct {
     }
 };
 
-fn sleepyNode(addr: u16, period_ms: u32) Yggdrasil {
+fn sleepyNode(addr: Address, period_ms: u32) Yggdrasil {
     var ygg = TestClock.node(addr);
     ygg.retransmit_timeout_ms = 3000;
     ygg.retransmit_jitter_ms = 1000;
@@ -2481,7 +2377,7 @@ fn sleepyNode(addr: u16, period_ms: u32) Yggdrasil {
 
 const ChainRoot = struct {
     var got_from_far: bool = false;
-    var far_addr: u16 = 3;
+    var far_addr: Address = 3;
 
     fn cb(packet: NetworkPacket) void {
         if (packet.origin == far_addr and packet.dest == 1 and std.mem.eql(u8, packet.body(), "far"))
@@ -2532,13 +2428,13 @@ test "sleepy nodes join through a sleepy relay out of range of the root" {
 
     try std.testing.expect(try air.runUntil(5 * 60_000, relayJoined));
     _ = try air.runUntil(TestClock.time + 10 * 60_000, never);
-    try std.testing.expectEqual(@as(?u16, 1), relay.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), relay.rootAddress());
 
     air.nodes = &.{ &root, &relay, &far };
     try std.testing.expect(try air.runUntil(TestClock.time + 20 * 60_000, chainJoined));
-    try std.testing.expectEqual(@as(?u16, 1), relay.rootAddress());
+    try std.testing.expectEqual(@as(?Address, 1), relay.rootAddress());
     try std.testing.expectEqual(@as(u8, 2), far.root.?.hops);
-    try std.testing.expectEqual(@as(u16, 2), far.root.?.via);
+    try std.testing.expectEqual(@as(Address, 2), far.root.?.via);
 
     try far.sendToRoot("far", MessageQueue.PRIORITY_LOW);
     try std.testing.expect(try air.runUntil(TestClock.time + 5 * 60_000, chainDelivered));
@@ -2600,7 +2496,7 @@ test "traffic to the root follows the adopted parent over an overheard direct ro
     _ = try n.registerNeighbor(1, 1);
 
     try n.sendToRoot("x", MessageQueue.PRIORITY_LOW);
-    try std.testing.expectEqual(@as(u16, 2), n.outgoing_packets.txBuffer(parent.mq_idx).?.to);
+    try std.testing.expectEqual(@as(Address, 2), n.outgoing_packets.txBuffer(parent.mq_idx).?.to);
     try std.testing.expect(n.outgoing_packets.txBuffer(1) == null);
 }
 
@@ -2635,6 +2531,126 @@ test "a full root ignores hellos and direct frames from new nodes" {
     try b.sayHello();
     try TestNet.hear(&root);
     try std.testing.expect(root.forwarding_table.neighborByAddr(3) != null);
+}
+
+fn compactApp(celsius: f32, buf: *[AppPacket.CompactReadings.MAX_LEN + 1]u8) []const u8 {
+    const r: AppPacket.CompactReadings = .{ .centi_celsius = AppPacket.CompactReadings.temperature(celsius) };
+    var rec: [AppPacket.CompactReadings.MAX_LEN]u8 = undefined;
+    const bytes = r.write(&rec);
+    buf[0] = @backingInt(AppPacket.Opcode.compact_readings);
+    @memcpy(buf[1..][0..bytes.len], bytes);
+    return buf[0 .. 1 + bytes.len];
+}
+
+fn relayLine() !struct { leaf: Yggdrasil, relay: Yggdrasil, root: Yggdrasil } {
+    var leaf = TestNet.node(1);
+    var relay = TestNet.node(2);
+    var root = TestNet.node(3);
+
+    _ = try leaf.registerNeighbor(2, 0);
+    _ = try relay.registerNeighbor(1, 0);
+    _ = try relay.registerNeighbor(3, 1);
+    _ = try root.registerNeighbor(2, 0);
+    try leaf.forwarding_table.setRoute(3, 0, 2);
+    try relay.forwarding_table.setRoute(3, 1, 1);
+    return .{ .leaf = leaf, .relay = relay, .root = root };
+}
+
+fn drain(from: *Yggdrasil, listeners: []const *Yggdrasil) !void {
+    for (0..4) |_| {
+        if (!try from.requestWrite()) break;
+        for (listeners) |listener| try TestNet.hear(listener);
+        if (TestNet.delivered != null) return;
+    }
+    return error.NothingDelivered;
+}
+
+fn expectBatch(origins: []const Address) !void {
+    const got = TestNet.delivered orelse return error.NothingDelivered;
+    const app = AppPacket.parse(got.body()).?;
+    try std.testing.expectEqual(AppPacket.Opcode.batched_readings, app.op);
+
+    var batch = AppPacket.ReadingBatch{ .bytes = app.payload };
+    for (origins) |origin| try std.testing.expectEqual(origin, batch.next().?.origin);
+    try std.testing.expect(batch.next() == null);
+    try std.testing.expectEqual(@as(usize, 0), batch.bytes.len);
+}
+
+test "a relay folds a forwarded reading into its own queued reading" {
+    var net = try relayLine();
+    var buf: [AppPacket.CompactReadings.MAX_LEN + 1]u8 = undefined;
+
+    try net.relay.send(3, compactApp(20.0, &buf), MessageQueue.PRIORITY_LOW);
+    try net.leaf.send(3, compactApp(21.0, &buf), MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&net.leaf, &.{&net.relay});
+
+    TestNet.delivered = null;
+    try drain(&net.relay, &.{ &net.leaf, &net.root });
+    try expectBatch(&.{ 2, 1 });
+}
+
+test "a held but unsent reading takes the merge and keeps relay origin" {
+    var net = try relayLine();
+    var buf: [AppPacket.CompactReadings.MAX_LEN + 1]u8 = undefined;
+
+    try net.leaf.send(3, compactApp(21.0, &buf), MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&net.leaf, &.{&net.relay});
+    _ = net.relay.outgoing_packets.txBuffer(1);
+
+    try net.relay.send(3, compactApp(20.0, &buf), MessageQueue.PRIORITY_LOW);
+
+    TestNet.delivered = null;
+    try drain(&net.relay, &.{ &net.leaf, &net.root });
+    try expectBatch(&.{ 1, 2 });
+    try std.testing.expectEqual(@as(Address, 2), TestNet.delivered.?.origin);
+}
+
+test "batches from deeper relays are flattened into one batch" {
+    var net = try relayLine();
+    var buf: [AppPacket.CompactReadings.MAX_LEN + 1]u8 = undefined;
+
+    var batch = [_]u8{ @backingInt(AppPacket.Opcode.batched_readings), 9, 0x01, 0x00, 0x01, 8, 0x01, 0x00, 0x02 };
+    try net.relay.send(3, compactApp(20.0, &buf), MessageQueue.PRIORITY_LOW);
+    try net.leaf.send(3, &batch, MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&net.leaf, &.{&net.relay});
+
+    TestNet.delivered = null;
+    try drain(&net.relay, &.{ &net.leaf, &net.root });
+    try expectBatch(&.{ 2, 9, 8 });
+}
+
+test "readings already on the air and non reading packets are never merged" {
+    var net = try relayLine();
+    var buf: [AppPacket.CompactReadings.MAX_LEN + 1]u8 = undefined;
+
+    try net.relay.send(3, compactApp(20.0, &buf), MessageQueue.PRIORITY_LOW);
+    try std.testing.expect(try net.relay.requestWrite());
+
+    try net.leaf.send(3, compactApp(21.0, &buf), MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&net.leaf, &.{&net.relay});
+    try net.relay.send(3, "raw", MessageQueue.PRIORITY_LOW);
+
+    try std.testing.expectEqual(AppPacket.Opcode.compact_readings, AppPacket.parse(net.relay.outgoing_packets.queued(1, 0).?.body()).?.op);
+    try std.testing.expect(net.relay.outgoing_packets.queued(1, 1) != null);
+}
+
+test "a full batch spills into a new packet" {
+    var net = try relayLine();
+    var buf: [AppPacket.CompactReadings.MAX_LEN + 1]u8 = undefined;
+
+    var big: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
+    big[0] = @backingInt(AppPacket.Opcode.batched_readings);
+    var n: usize = 1;
+    while (n + 4 <= big.len) : (n += 4) {
+        big[n] = 50;
+        big[n + 1] = 0x01;
+        big[n + 2] = 0;
+        big[n + 3] = 0;
+    }
+    try net.relay.send(3, big[0..n], MessageQueue.PRIORITY_LOW);
+    try net.relay.send(3, compactApp(20.0, &buf), MessageQueue.PRIORITY_LOW);
+
+    try std.testing.expect(net.relay.outgoing_packets.queued(1, 1) != null);
 }
 
 test {

@@ -62,6 +62,11 @@ pub fn PriorityQueue(comptime T: type, comptime MAX_ELEMS: usize) type {
                 i = parent;
             }
         }
+        pub fn at(mh: *Heap, i: usize) ?*T {
+            if (i >= mh.tree.size) return null;
+            return &mh.tree.ar[i].val;
+        }
+
         pub fn pop(mh: *Heap) ?T {
             if (mh.tree.size == 0) return null;
 

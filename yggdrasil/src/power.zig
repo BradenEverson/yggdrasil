@@ -2,14 +2,13 @@ const std = @import("std");
 const NetworkPacket = @import("network_packet.zig");
 pub const Radio = @import("lora.zig").Radio;
 
-pub const ACK_FRAME: usize = NetworkPacket.HEADER_LEN + 2;
-pub const MAX_WAKE_IN: u32 = std.math.maxInt(u24);
+pub const ACK_FRAME: usize = NetworkPacket.BASE_HEADER_LEN + 2;
 pub const PERIOD_UNIT_MS: u32 = 100;
 
 pub const Power = struct {
     period_ms: u32 = 0,
     window_ms: u32 = 0,
-    frame_budget: usize = 64,
+    frame_budget: usize = 32,
     guard_ms: u32 = 20,
     drift_ppm: u32 = 40,
     radio_wake_ms: u32 = 100,
