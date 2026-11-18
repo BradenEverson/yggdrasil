@@ -168,7 +168,8 @@ fn wakeRadio() void {
     };
     radio_awake = true;
     const took = hal.timer.millis() -% start;
-    log("radio wake took {} ms\r\n", .{took});
+    const w = lora.last_wake;
+    log("radio wake took {} ms attempts={} at={} params={} power={}\r\n", .{ took, w.attempts, w.at_ms, w.params_ms, w.power_ms });
 }
 
 fn serviceRadio() void {

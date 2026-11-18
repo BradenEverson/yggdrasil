@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const Radio = struct {
-    spreading_factor: u4 = 9,
+    spreading_factor: u4 = 7,
     bandwidth_hz: u32 = 125_000,
     coding_rate: u3 = 1,
     preamble: u8 = 4,
@@ -11,6 +11,10 @@ pub const Radio = struct {
 
     pub fn symbolUs(r: Radio) u64 {
         return (@as(u64, 1) << r.spreading_factor) * 1_000_000 / r.bandwidth_hz;
+    }
+
+    pub fn symbolsMs(r: Radio, symbols: u32) u32 {
+        return @intCast((@as(u64, symbols) * r.symbolUs() + 999) / 1000);
     }
 
     pub fn airtimeUs(r: Radio, payload_len: usize) u64 {

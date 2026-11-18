@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:8765/readings) to stream raw reading payloads to; CSV logging is used if omitted")
     parser.add_argument("--csv", default="log.csv", help="CSV file to append readings to when --ws is not given")
     parser.add_argument("--port", default="/dev/ttyTHS1", help="RYLR896 serial port")
-    parser.add_argument("--sf", type=int, default=9, help="LoRa spreading factor (7-12), must match every node")
+    parser.add_argument("--sf", type=int, default=7, help="LoRa spreading factor (7-12), must match every node")
     parser.add_argument("--bw", type=int, default=125000, choices=sorted(BANDWIDTH_CODES), help="LoRa bandwidth in Hz")
     parser.add_argument("--cr", type=int, default=1, choices=[1, 2, 3, 4], help="LoRa coding rate (1 = 4/5)")
     parser.add_argument("--preamble", type=int, default=4, choices=[4, 5, 6, 7], help="LoRa programmed preamble")

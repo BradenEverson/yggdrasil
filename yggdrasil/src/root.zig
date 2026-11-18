@@ -536,12 +536,12 @@ pub const Yggdrasil = struct {
             return;
 
         const period = p.periodMs();
-        const lead = p.windowMs() + p.radio_wake_ms + p.guard_ms;
+        const lead = p.windowMs() + p.radio_wake_ms + p.baseGuardMs();
         const target = parent.next_window -% lead;
 
         const ours = ygg.ownWindowStart(now);
         const offset = ours -% power.windowAt(target, period, ours);
-        const tolerance = @max(p.windowMs() / 4, 4 * p.guard_ms);
+        const tolerance = @max(p.windowMs() / 4, 4 * p.baseGuardMs());
         if (offset <= tolerance or period - offset <= tolerance)
             return;
 
@@ -711,7 +711,7 @@ pub const Yggdrasil = struct {
 
     fn beaconAt(ygg: *Yggdrasil, p: Power, now: u32, ahead: u32) u32 {
         const start = ygg.ownWindowStart(now +% ahead);
-        return start +% p.windowMs() +% ygg.random(p.guard_ms);
+        return start +% p.windowMs() +% ygg.random(p.baseGuardMs());
     }
 
     fn outsideOwnWindow(ygg: *Yggdrasil, at: u32) u32 {
@@ -2278,7 +2278,7 @@ test "rooted sleepy nodes beacon right after their own window every few periods"
             beacons += 1;
             const now = TestClock.time;
             const since = now -% b.ownWindowStart(now -% p.windowMs());
-            try std.testing.expect(since >= p.windowMs() and since <= p.windowMs() + p.guard_ms + 5);
+            try std.testing.expect(since >= p.windowMs() and since <= p.windowMs() + p.baseGuardMs() + 5);
             try std.testing.expectEqual(@as(u8, 1), got.hops);
         }
     }
