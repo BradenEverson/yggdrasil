@@ -33,6 +33,7 @@ pub const Opcode = enum(u8) {
     sensor_readings,
     compact_readings,
     batched_readings,
+    reading_series,
 };
 
 op: Opcode = .hello,
@@ -272,6 +273,172 @@ pub const ReadingBatch = struct {
         var batch = ReadingBatch{ .bytes = bytes };
         while (batch.next()) |_| {}
         return batch.bytes.len == 0;
+    }
+};
+
+pub const ReadingSeries = struct {
+    origin: Address,
+    mask: u8,
+    count: u8,
+    interval_s: u16,
+    age_s: u16,
+    samples: []const u8,
+
+    pub const HEADER_LEN: usize = 6;
+    pub const INTERVAL_UNIT_S: u16 = 10;
+    pub const MAX_INTERVAL_S: u16 = 255 * INTERVAL_UNIT_S;
+    pub const ESCAPE: u8 = 0x80;
+    const FIELDS: usize = 4;
+
+    pub const Error = error{ NoSpaceLeft, InvalidSeries };
+
+    pub const Record = struct {
+        series: ReadingSeries,
+        rest: []const u8,
+    };
+
+    pub fn sampleAgeS(series: ReadingSeries, index: usize) u32 {
+        return @as(u32, series.age_s) + @as(u32, @intCast(series.count - 1 - index)) * series.interval_s;
+    }
+
+    pub fn parseRecord(bytes: []const u8) ?Record {
+        if (bytes.len < HEADER_LEN) return null;
+        const mask = bytes[1];
+        if (mask == 0 or mask & ~@as(u8, 0x0F) != 0) return null;
+        const count = bytes[2];
+        if (count == 0) return null;
+
+        const fields: usize = @popCount(mask);
+        var n: usize = HEADER_LEN + 2 * fields;
+        if (bytes.len < n) return null;
+        for (1..count) |_| {
+            for (0..fields) |_| {
+                if (n >= bytes.len) return null;
+                n += if (bytes[n] == ESCAPE) 3 else 1;
+            }
+        }
+        if (n > bytes.len) return null;
+
+        return .{
+            .series = .{
+                .origin = bytes[0],
+                .mask = mask,
+                .count = count,
+                .interval_s = @as(u16, bytes[3]) * INTERVAL_UNIT_S,
+                .age_s = std.mem.readInt(u16, bytes[4..6], .big),
+                .samples = bytes[HEADER_LEN..n],
+            },
+            .rest = bytes[n..],
+        };
+    }
+
+    pub fn valid(bytes: []const u8) bool {
+        if (bytes.len == 0) return false;
+        var rest = bytes;
+        while (rest.len != 0) rest = (parseRecord(rest) orelse return false).rest;
+        return true;
+    }
+
+    pub fn iterator(series: ReadingSeries) Iterator {
+        return .{ .series = series };
+    }
+
+    pub const Iterator = struct {
+        series: ReadingSeries,
+        index: usize = 0,
+        pos: usize = 0,
+        values: [FIELDS]u16 = @splat(0),
+
+        pub fn next(it: *Iterator) ?CompactReadings {
+            if (it.index >= it.series.count) return null;
+            const b = it.series.samples;
+            var r: CompactReadings = .{};
+            for (0..FIELDS) |f| {
+                if (it.series.mask & (@as(u8, 1) << @intCast(f)) == 0) continue;
+                if (it.index == 0 or b[it.pos] == ESCAPE) {
+                    if (it.index != 0) it.pos += 1;
+                    it.values[f] = std.mem.readInt(u16, b[it.pos..][0..2], .big);
+                    it.pos += 2;
+                } else {
+                    const delta: i8 = @bitCast(b[it.pos]);
+                    it.values[f] +%= @bitCast(@as(i16, delta));
+                    it.pos += 1;
+                }
+                setRaw(&r, f, it.values[f]);
+            }
+            it.index += 1;
+            return r;
+        }
+    };
+
+    pub fn write(origin: Address, interval_s: u16, age_s: u16, samples: []const CompactReadings, buf: []u8) Error![]u8 {
+        if (samples.len == 0 or samples.len > std.math.maxInt(u8)) return error.InvalidSeries;
+        if (interval_s % INTERVAL_UNIT_S != 0 or interval_s > MAX_INTERVAL_S) return error.InvalidSeries;
+
+        var mask: u8 = 0;
+        for (0..FIELDS) |f| {
+            if (raw(samples[0], f) != null) mask |= @as(u8, 1) << @intCast(f);
+        }
+        if (mask == 0) return error.InvalidSeries;
+
+        if (buf.len < HEADER_LEN) return error.NoSpaceLeft;
+        buf[0] = origin;
+        buf[1] = mask;
+        buf[2] = @intCast(samples.len);
+        buf[3] = @intCast(interval_s / INTERVAL_UNIT_S);
+        std.mem.writeInt(u16, buf[4..6], age_s, .big);
+
+        var n: usize = HEADER_LEN;
+        var prev: [FIELDS]u16 = @splat(0);
+        for (samples, 0..) |sample, i| {
+            for (0..FIELDS) |f| {
+                if (mask & (@as(u8, 1) << @intCast(f)) == 0) continue;
+                const v = raw(sample, f) orelse prev[f];
+                const delta: i16 = @bitCast(v -% prev[f]);
+                if (i != 0 and delta >= -127 and delta <= 127) {
+                    if (buf.len < n + 1) return error.NoSpaceLeft;
+                    buf[n] = @bitCast(@as(i8, @intCast(delta)));
+                    n += 1;
+                } else {
+                    const extra: usize = if (i == 0) 0 else 1;
+                    if (buf.len < n + extra + 2) return error.NoSpaceLeft;
+                    if (i != 0) buf[n] = ESCAPE;
+                    std.mem.writeInt(u16, buf[n + extra ..][0..2], v, .big);
+                    n += extra + 2;
+                }
+                prev[f] = v;
+            }
+        }
+        return buf[0..n];
+    }
+
+    fn raw(r: CompactReadings, field: usize) ?u16 {
+        return switch (field) {
+            0 => if (r.centi_celsius) |v| @as(u16, @bitCast(v)) else null,
+            1 => r.deci_hpa,
+            2 => r.centi_pct,
+            else => r.gas_log2_q11,
+        };
+    }
+
+    fn setRaw(r: *CompactReadings, field: usize, v: u16) void {
+        switch (field) {
+            0 => r.centi_celsius = @bitCast(v),
+            1 => r.deci_hpa = v,
+            2 => r.centi_pct = v,
+            else => r.gas_log2_q11 = v,
+        }
+    }
+};
+
+pub const SeriesBatch = struct {
+    bytes: []const u8,
+
+    pub fn next(batch: *SeriesBatch) ?ReadingSeries {
+        if (batch.bytes.len == 0) return null;
+        const record = ReadingSeries.parseRecord(batch.bytes) orelse return null;
+        batch.bytes = record.rest;
+        return record.series;
     }
 };
 
@@ -650,6 +817,78 @@ test "Reading batches walk every entry and reject trailing garbage" {
     try std.testing.expect(!ReadingBatch.valid(bytes[0..9]));
     try std.testing.expect(!ReadingBatch.valid(&.{}));
     try std.testing.expect(!ReadingBatch.valid(&.{ 4, 0x10, 0, 0 }));
+}
+
+fn sampleAt(c: f32, hpa: f32, pct: f32) CompactReadings {
+    return .{
+        .centi_celsius = CompactReadings.temperature(c),
+        .deci_hpa = CompactReadings.pressure(hpa * 100.0),
+        .centi_pct = CompactReadings.humidity(pct),
+    };
+}
+
+test "Reading series round trips with small deltas and escapes" {
+    const samples = [_]CompactReadings{
+        sampleAt(21.00, 1004.2, 55.00),
+        sampleAt(21.05, 1004.2, 54.90),
+        sampleAt(23.50, 1004.1, 54.80),
+        sampleAt(-3.20, 1004.3, 61.00),
+        sampleAt(-3.21, 1004.3, 60.99),
+    };
+    var buf: [64]u8 = undefined;
+    const bytes = try ReadingSeries.write(7, 60, 3, &samples, &buf);
+    try std.testing.expectEqual(@as(usize, ReadingSeries.HEADER_LEN + 6 + 3 + 5 + 7 + 3), bytes.len);
+
+    const record = ReadingSeries.parseRecord(bytes).?;
+    try std.testing.expectEqual(@as(usize, 0), record.rest.len);
+    const series = record.series;
+    try std.testing.expectEqual(@as(Address, 7), series.origin);
+    try std.testing.expectEqual(@as(u8, 5), series.count);
+    try std.testing.expectEqual(@as(u16, 60), series.interval_s);
+    try std.testing.expectEqual(@as(u32, 243), series.sampleAgeS(0));
+    try std.testing.expectEqual(@as(u32, 3), series.sampleAgeS(4));
+
+    var it = series.iterator();
+    for (samples) |want| {
+        const got = it.next().?;
+        try std.testing.expectEqual(want.centi_celsius, got.centi_celsius);
+        try std.testing.expectEqual(want.deci_hpa, got.deci_hpa);
+        try std.testing.expectEqual(want.centi_pct, got.centi_pct);
+        try std.testing.expectEqual(@as(?u16, null), got.gas_log2_q11);
+    }
+    try std.testing.expect(it.next() == null);
+}
+
+test "Reading series repeat a missing field and reject bad input" {
+    var later = sampleAt(20.0, 1000.0, 50.0);
+    later.deci_hpa = null;
+    const samples = [_]CompactReadings{ sampleAt(20.0, 1000.0, 50.0), later };
+    var buf: [32]u8 = undefined;
+    const bytes = try ReadingSeries.write(1, 60, 0, &samples, &buf);
+    var it = ReadingSeries.parseRecord(bytes).?.series.iterator();
+    _ = it.next();
+    try std.testing.expectEqual(CompactReadings.pressure(100_000.0), it.next().?.deci_hpa.?);
+
+    try std.testing.expectError(error.InvalidSeries, ReadingSeries.write(1, 65, 0, &samples, &buf));
+    try std.testing.expectError(error.InvalidSeries, ReadingSeries.write(1, 60, 0, &.{}, &buf));
+    try std.testing.expectError(error.NoSpaceLeft, ReadingSeries.write(1, 60, 0, &samples, buf[0..8]));
+    try std.testing.expect(!ReadingSeries.valid(bytes[0 .. bytes.len - 1]));
+    try std.testing.expect(!ReadingSeries.valid(&.{}));
+}
+
+test "Series batches walk concatenated records" {
+    const a = [_]CompactReadings{ sampleAt(20.0, 1000.0, 50.0), sampleAt(20.1, 1000.0, 50.0) };
+    const b = [_]CompactReadings{sampleAt(10.0, 990.0, 80.0)};
+    var buf: [64]u8 = undefined;
+    const first = try ReadingSeries.write(4, 60, 0, &a, &buf);
+    const second = try ReadingSeries.write(9, 60, 0, &b, buf[first.len..]);
+    const both = buf[0 .. first.len + second.len];
+    try std.testing.expect(ReadingSeries.valid(both));
+
+    var batch = SeriesBatch{ .bytes = both };
+    try std.testing.expectEqual(@as(Address, 4), batch.next().?.origin);
+    try std.testing.expectEqual(@as(Address, 9), batch.next().?.origin);
+    try std.testing.expect(batch.next() == null);
 }
 
 test "Compact quantization clamps out of range values" {

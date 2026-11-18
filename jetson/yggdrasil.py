@@ -17,6 +17,7 @@ OP_TOPOLOGY_INFO = 3
 OP_SENSOR_READINGS = 4
 OP_COMPACT_READINGS = 5
 OP_BATCHED_READINGS = 6
+OP_READING_SERIES = 7
 
 _VALUE_FORMATS = ["B", "H", "I", "Q", "b", "h", "i", "q", "f", "d"]
 _FLOAT32 = _VALUE_FORMATS.index("f")
@@ -253,3 +254,47 @@ def parse_batched_readings(payload):
         entries.append((payload[i], readings))
         i += 1 + size
     return entries
+
+
+_SERIES_HEADER_LEN = 6
+_SERIES_INTERVAL_UNIT_S = 10
+_SERIES_ESCAPE = 0x80
+
+
+def parse_reading_series(payload):
+    records = []
+    i = 0
+    while i < len(payload):
+        if i + _SERIES_HEADER_LEN > len(payload):
+            return []
+        origin, mask, count, interval = payload[i], payload[i + 1], payload[i + 2], payload[i + 3]
+        if mask == 0 or mask >> len(_COMPACT_FIELDS) or count == 0:
+            return []
+        age_s = int.from_bytes(payload[i + 4:i + 6], "big")
+        interval_s = interval * _SERIES_INTERVAL_UNIT_S
+        fields = [(bit, field) for bit, field in enumerate(_COMPACT_FIELDS) if mask & (1 << bit)]
+        i += _SERIES_HEADER_LEN
+        values = [0] * len(fields)
+        samples = []
+        for index in range(count):
+            for slot in range(len(fields)):
+                if index == 0 or payload[i] == _SERIES_ESCAPE:
+                    if index != 0:
+                        i += 1
+                    if i + 2 > len(payload):
+                        return []
+                    values[slot] = int.from_bytes(payload[i:i + 2], "big")
+                    i += 2
+                else:
+                    delta = payload[i] - 256 if payload[i] > 127 else payload[i]
+                    values[slot] = (values[slot] + delta) & 0xFFFF
+                    i += 1
+                if i > len(payload):
+                    return []
+            readings = []
+            for (bit, (name, fmt, decode)), raw in zip(fields, values):
+                (value,) = struct.unpack(fmt, raw.to_bytes(2, "big"))
+                readings.append((name, decode(value)))
+            samples.append((age_s + (count - 1 - index) * interval_s, readings))
+        records.append((origin, samples))
+    return records

@@ -180,10 +180,16 @@ pub const Bme688 = struct {
     }
 
     pub fn measure(self: *Bme688) Bme688Error!Reading {
-        try self.triggerForced();
-
+        try self.start();
         hal.timer.delayMs(self.estimateDurationMs());
+        return self.finish();
+    }
 
+    pub fn start(self: *Bme688) Bme688Error!void {
+        try self.triggerForced();
+    }
+
+    pub fn finish(self: *Bme688) Bme688Error!Reading {
         var b: [FIELD_LEN]u8 = undefined;
         var waited: u32 = 0;
         while (true) {

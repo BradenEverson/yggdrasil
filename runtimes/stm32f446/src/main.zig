@@ -18,6 +18,10 @@ const FAIL_RETRY_MS: u32 = 60_000;
 const NETWORK_ID: u16 = 5;
 const NODE_ADDR: yggdrasil.Address = node_config.node_addr;
 const PERIOD_MS: u32 = node_config.period_ms;
+const SAMPLE_MS: u32 = node_config.sample_ms;
+const SAMPLE_INTERVAL_S: u16 = @intCast(SAMPLE_MS / 1000);
+const SAMPLES_PER_SEND: usize = @max(PERIOD_MS / SAMPLE_MS, 1);
+const MAX_SERIES: usize = @min(@max(2 * SAMPLES_PER_SEND, 4), 32);
 const RADIO_BROADCAST_ADDR: u16 = 0;
 
 const RADIO: yggdrasil.lora.Radio = .{
@@ -39,6 +43,9 @@ const POWER: yggdrasil.Power = .{
 comptime {
     if (PERIOD_MS % yggdrasil.power.PERIOD_UNIT_MS != 0 or PERIOD_MS == 0)
         @compileError("period_ms must be a nonzero multiple of 100");
+    if (SAMPLE_MS == 0 or SAMPLE_MS % (yggdrasil.AppPacket.ReadingSeries.INTERVAL_UNIT_S * 1000) != 0 or
+        SAMPLE_MS > @as(u32, yggdrasil.AppPacket.ReadingSeries.MAX_INTERVAL_S) * 1000)
+        @compileError("sample_ms must be a nonzero multiple of 10000, at most 2550000");
 }
 
 const used_pins = [_]hal.gpio.Pin{
@@ -59,7 +66,13 @@ var ygg_rx: [YGG_RX_SIZE]u8 = undefined;
 
 var lora: Rylr = undefined;
 var ygg: yggdrasil.Yggdrasil = undefined;
+var sensor: bme688.Bme688 = undefined;
 var radio_awake = false;
+var next_sample: u32 = 0;
+
+var series: [MAX_SERIES]yggdrasil.AppPacket.CompactReadings = undefined;
+var series_at: [MAX_SERIES]u32 = undefined;
+var series_len: usize = 0;
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     if (!node_config.log) return;
@@ -160,6 +173,15 @@ var seen_frames: u32 = 0;
 fn wakeRadio() void {
     if (radio_awake) return;
     const start = hal.timer.millis();
+    const slot = ygg.rootAddress() != null and @as(i32, @bitCast(next_sample -% start)) <= @as(i32, @intCast(SAMPLE_MS / 2));
+    const sampling = slot and blk: {
+        sensor.start() catch |e| {
+            log("measure failed: {s}\r\n", .{@errorName(e)});
+            break :blk false;
+        };
+        break :blk true;
+    };
+    if (slot) next_sample = start +% SAMPLE_MS;
     lora.wake() catch |e| {
         log("radio wake failed: {s}\r\n", .{@errorName(e)});
         lora.reset();
@@ -170,6 +192,13 @@ fn wakeRadio() void {
     const took = hal.timer.millis() -% start;
     const w = lora.last_wake;
     log("radio wake took {} ms attempts={} at={} params={} power={}\r\n", .{ took, w.attempts, w.at_ms, w.params_ms, w.power_ms });
+
+    if (sampling) {
+        if (sensor.finish()) |r| {
+            record(r, start);
+        } else |e| log("measure failed: {s}\r\n", .{@errorName(e)});
+    }
+    if (series_len >= SAMPLES_PER_SEND) flushSeries();
 }
 
 fn serviceRadio() void {
@@ -224,7 +253,7 @@ fn app() void {
         .speed = .standard,
     });
 
-    var sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, bme688.LOW_POWER) catch |e| fail("BME688 init", e);
+    sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, bme688.LOW_POWER) catch |e| fail("BME688 init", e);
 
     lora = .{
         .uart = lora_uart,
@@ -267,16 +296,16 @@ fn app() void {
     log("window {} ms\r\n", .{POWER.windowMs()});
 
     var known_root: ?yggdrasil.Address = null;
-    var next_sample: u32 = hal.timer.millis() +% random(PERIOD_MS);
+    next_sample = hal.timer.millis() +% random(SAMPLE_MS);
 
     while (true) {
         const now = hal.timer.millis();
 
-        const overdue = reached(now, next_sample +% PERIOD_MS / 4);
+        const overdue = reached(now, next_sample +% SAMPLE_MS / 4);
         if (reached(now, next_sample) and (overdue or ygg.idleFor() != 0)) {
-            next_sample +%= PERIOD_MS;
-            if (reached(now, next_sample)) next_sample = now +% PERIOD_MS;
-            sample(&ygg, &sensor);
+            next_sample +%= SAMPLE_MS;
+            if (reached(now, next_sample)) next_sample = now +% SAMPLE_MS;
+            sample();
         }
 
         if (ygg.idleFor() == 0) {
@@ -336,20 +365,61 @@ fn app() void {
     }
 }
 
-fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688) void {
-    if (node.rootAddress() == null) return;
-
+fn sample() void {
+    if (ygg.rootAddress() == null) return;
+    const at = hal.timer.millis();
     const r = sensor.measure() catch |e| {
         log("measure failed: {s}\r\n", .{@errorName(e)});
         return;
     };
+    record(r, at);
+}
 
-    var readings_buf: [yggdrasil.AppPacket.CompactReadings.MAX_LEN]u8 = undefined;
-    const packet: yggdrasil.AppPacket = .{ .op = .compact_readings, .payload = compactReadings(r).write(&readings_buf) };
+fn record(r: bme688.Reading, at: u32) void {
+    if (series_len == MAX_SERIES) dropSamples(1);
+    series[series_len] = compactReadings(r);
+    series_at[series_len] = at;
+    series_len += 1;
+}
 
-    node.sendAppToRoot(packet, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
+fn dropSamples(n: usize) void {
+    std.mem.copyForwards(yggdrasil.AppPacket.CompactReadings, series[0 .. series_len - n], series[n..series_len]);
+    std.mem.copyForwards(u32, series_at[0 .. series_len - n], series_at[n..series_len]);
+    series_len -= n;
+}
+
+fn evenlySpaced(prev: u32, next: u32) bool {
+    const gap = next -% prev;
+    const off = if (gap > SAMPLE_MS) gap - SAMPLE_MS else SAMPLE_MS - gap;
+    return off <= SAMPLE_MS / 4;
+}
+
+fn flushSeries() void {
+    if (series_len == 0 or ygg.rootAddress() == null) return;
+    const Series = yggdrasil.AppPacket.ReadingSeries;
+    const now = hal.timer.millis();
+
+    var buf: [yggdrasil.NetworkPacket.MAX_PAYLOAD_SIZE - 1]u8 = undefined;
+    var n: usize = 0;
+    var start: usize = 0;
+    var records: usize = 0;
+    while (start < series_len) {
+        var end = start + 1;
+        while (end < series_len and evenlySpaced(series_at[end - 1], series_at[end])) end += 1;
+        const age_s: u16 = @intCast(@min((now -% series_at[end - 1]) / 1000, std.math.maxInt(u16)));
+        const rec = Series.write(NODE_ADDR, SAMPLE_INTERVAL_S, age_s, series[start..end], buf[n..]) catch break;
+        n += rec.len;
+        records += 1;
+        start = end;
+    }
+    if (start == 0) return;
+
+    ygg.sendAppToRoot(.{ .op = .reading_series, .payload = buf[0..n] }, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
         log("send failed: {s}\r\n", .{@errorName(e)});
+        return;
     };
+    log("queued {} samples in {} records, {} bytes\r\n", .{ start, records, n });
+    dropSamples(start);
 }
 
 fn compactReadings(r: bme688.Reading) yggdrasil.AppPacket.CompactReadings {

@@ -34,7 +34,8 @@ pub fn build(b: *std.Build) void {
 
     const node_config = b.addOptions();
     node_config.addOption(u8, "node_addr", b.option(u8, "node_addr", "Yggdrasil address of this node, 0-254") orelse 1);
-    node_config.addOption(u32, "period_ms", b.option(u32, "period_ms", "Listen and sample period in ms, multiple of 100") orelse 60_000);
+    node_config.addOption(u32, "period_ms", b.option(u32, "period_ms", "Radio listen and send period in ms, multiple of 100") orelse 300_000);
+    node_config.addOption(u32, "sample_ms", b.option(u32, "sample_ms", "Sensor sample interval in ms, multiple of 10000, readings are batched and sent once per period") orelse 60_000);
     node_config.addOption(u4, "sf", b.option(u4, "sf", "LoRa spreading factor 7-12, must match the whole network") orelse 7);
     node_config.addOption(u32, "bw", b.option(u32, "bw", "LoRa bandwidth in Hz, must match the whole network") orelse 125_000);
     node_config.addOption(u3, "cr", b.option(u3, "cr", "LoRa coding rate 1-4, must match the whole network") orelse 1);

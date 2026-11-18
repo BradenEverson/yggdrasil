@@ -6,7 +6,7 @@ import select
 import struct
 import time
 import websocket
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import yggdrasil
 from rylr896 import RYLR896
@@ -235,22 +235,31 @@ class Hub(object):
                 print(f"Malformed batch from Node {origin} (via {from_addr})")
             for entry_origin, readings in entries:
                 self.on_readings(entry_origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
+        elif op == yggdrasil.OP_READING_SERIES and not broadcast:
+            records = yggdrasil.parse_reading_series(payload)
+            if not records:
+                print(f"Malformed series from Node {origin} (via {from_addr})")
+            for entry_origin, samples in records:
+                for age_s, readings in samples:
+                    wire = yggdrasil.encode_sensor_readings(readings + [("age_s", float(age_s))])
+                    self.on_readings(entry_origin, from_addr, readings, wire, age_s)
         elif op == yggdrasil.OP_HELLO and broadcast:
             print(f"Hello from {from_addr}")
 
-    def on_readings(self, origin, from_addr, readings, wire):
+    def on_readings(self, origin, from_addr, readings, wire, age_s=0):
         if not readings:
             print(f"Malformed readings from Node {origin} (via {from_addr})")
             return
         pretty = "  ".join(f"{n}={v:.2f}" if isinstance(v, float) else f"{n}={v}" for n, v in readings)
-        print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}): {pretty}")
+        age = f", {age_s} s ago" if age_s else ""
+        print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}{age}): {pretty}")
 
         if self.stream is not None:
             self.stream.send(struct.pack(">H", origin) + wire)
             return
 
         row = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": (datetime.now() - timedelta(seconds=age_s)).isoformat(timespec="seconds"),
             "node_address": origin,
             "via": from_addr,
             "rssi": self.last_rssi,

@@ -1156,15 +1156,17 @@ pub const Yggdrasil = struct {
         var new_buf: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
         const held = readingEntries(target, &held_buf) orelse return false;
         const new = readingEntries(incoming, &new_buf) orelse return false;
+        if (held.op != new.op)
+            return false;
 
-        const len = 1 + held.len + new.len;
+        const len = 1 + held.bytes.len + new.bytes.len;
         if (len > NetworkPacket.MAX_PAYLOAD_SIZE)
             return false;
 
         var out: [NetworkPacket.MAX_PAYLOAD_SIZE]u8 = undefined;
-        out[0] = @backingInt(AppPacket.Opcode.batched_readings);
-        @memcpy(out[1..][0..held.len], held);
-        @memcpy(out[1 + held.len ..][0..new.len], new);
+        out[0] = @backingInt(held.op);
+        @memcpy(out[1..][0..held.bytes.len], held.bytes);
+        @memcpy(out[1 + held.bytes.len ..][0..new.bytes.len], new.bytes);
 
         target.setPayload(out[0..len]) catch return false;
         target.origin = ygg.address;
@@ -1172,20 +1174,31 @@ pub const Yggdrasil = struct {
         return true;
     }
 
-    fn readingEntries(packet: *const NetworkPacket, buf: []u8) ?[]const u8 {
+    const ReadingEntries = struct {
+        op: AppPacket.Opcode,
+        bytes: []const u8,
+    };
+
+    fn readingEntries(packet: *const NetworkPacket, buf: []u8) ?ReadingEntries {
         const app = AppPacket.parse(packet.body()) orelse return null;
         switch (app.op) {
             .compact_readings => {
                 _ = AppPacket.CompactReadings.parse(app.payload) orelse return null;
                 buf[0] = packet.origin;
                 @memcpy(buf[1..][0..app.payload.len], app.payload);
-                return buf[0 .. 1 + app.payload.len];
+                return .{ .op = .batched_readings, .bytes = buf[0 .. 1 + app.payload.len] };
             },
             .batched_readings => {
                 if (!AppPacket.ReadingBatch.valid(app.payload))
                     return null;
                 @memcpy(buf[0..app.payload.len], app.payload);
-                return buf[0..app.payload.len];
+                return .{ .op = .batched_readings, .bytes = buf[0..app.payload.len] };
+            },
+            .reading_series => {
+                if (!AppPacket.ReadingSeries.valid(app.payload))
+                    return null;
+                @memcpy(buf[0..app.payload.len], app.payload);
+                return .{ .op = .reading_series, .bytes = buf[0..app.payload.len] };
             },
             else => return null,
         }
@@ -2631,6 +2644,56 @@ test "readings already on the air and non reading packets are never merged" {
     try net.relay.send(3, "raw", MessageQueue.PRIORITY_LOW);
 
     try std.testing.expectEqual(AppPacket.Opcode.compact_readings, AppPacket.parse(net.relay.outgoing_packets.queued(1, 0).?.body()).?.op);
+    try std.testing.expect(net.relay.outgoing_packets.queued(1, 1) != null);
+}
+
+fn seriesApp(origin: Address, celsius: f32, buf: []u8) ![]const u8 {
+    const C = AppPacket.CompactReadings;
+    const samples = [_]C{
+        .{ .centi_celsius = C.temperature(celsius) },
+        .{ .centi_celsius = C.temperature(celsius + 0.1) },
+    };
+    buf[0] = @backingInt(AppPacket.Opcode.reading_series);
+    const record = try AppPacket.ReadingSeries.write(origin, 60, 1, &samples, buf[1..]);
+    return buf[0 .. 1 + record.len];
+}
+
+test "a relay folds a forwarded series into its own queued series" {
+    var net = try relayLine();
+    var relay_buf: [32]u8 = undefined;
+    var leaf_buf: [32]u8 = undefined;
+
+    try net.relay.send(3, try seriesApp(2, 20.0, &relay_buf), MessageQueue.PRIORITY_LOW);
+    try net.leaf.send(3, try seriesApp(1, 21.0, &leaf_buf), MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&net.leaf, &.{&net.relay});
+
+    TestNet.delivered = null;
+    try drain(&net.relay, &.{ &net.leaf, &net.root });
+    const app = AppPacket.parse(TestNet.delivered.?.body()).?;
+    try std.testing.expectEqual(AppPacket.Opcode.reading_series, app.op);
+
+    var batch = AppPacket.SeriesBatch{ .bytes = app.payload };
+    const first = batch.next().?;
+    try std.testing.expectEqual(@as(Address, 2), first.origin);
+    try std.testing.expectEqual(@as(u8, 2), first.count);
+    const second = batch.next().?;
+    try std.testing.expectEqual(@as(Address, 1), second.origin);
+    var it = second.iterator();
+    _ = it.next();
+    try std.testing.expectEqual(AppPacket.CompactReadings.temperature(21.1), it.next().?.centi_celsius.?);
+    try std.testing.expect(batch.next() == null);
+}
+
+test "series and single readings are not mixed into one packet" {
+    var net = try relayLine();
+    var series_buf: [32]u8 = undefined;
+    var buf: [AppPacket.CompactReadings.MAX_LEN + 1]u8 = undefined;
+
+    try net.relay.send(3, try seriesApp(2, 20.0, &series_buf), MessageQueue.PRIORITY_LOW);
+    try net.leaf.send(3, compactApp(21.0, &buf), MessageQueue.PRIORITY_LOW);
+    try TestNet.transmit(&net.leaf, &.{&net.relay});
+
+    try std.testing.expectEqual(AppPacket.Opcode.reading_series, AppPacket.parse(net.relay.outgoing_packets.queued(1, 0).?.body()).?.op);
     try std.testing.expect(net.relay.outgoing_packets.queued(1, 1) != null);
 }
 
