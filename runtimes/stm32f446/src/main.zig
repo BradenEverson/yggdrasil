@@ -124,7 +124,7 @@ fn fail(what: []const u8, err: anyerror) noreturn {
     log("{s} failed: {s}\r\n", .{ what, @errorName(err) });
     sleepRadio();
     quiesce();
-    if (hal.rtc.ready) hal.lowpower.stopFor(FAIL_RETRY_MS);
+    if (hal.rtc.ready) stopFor(FAIL_RETRY_MS);
     hal.reset();
 }
 
@@ -157,6 +157,20 @@ export fn run() void {
 fn quiesce() void {
     if (node_config.log) hal.uart.flush(debug);
     hal.uart.flush(lora_uart);
+}
+
+const USART_AF: u4 = 7;
+const I2C_AF: u4 = 4;
+
+fn stopFor(ms: u32) void {
+    hal.gpio.analogMask(.a, (1 << 9) | (1 << 10));
+    hal.gpio.analogMask(.b, (1 << 8) | (1 << 9));
+    hal.lowpower.stopFor(ms);
+    hal.gpio.alternate(.b, 8, I2C_AF);
+    hal.gpio.alternate(.b, 9, I2C_AF);
+    hal.gpio.alternate(.a, 9, USART_AF);
+    hal.gpio.alternate(.a, 10, USART_AF);
+    hal.gpio.pullUp(.a, 10);
 }
 
 fn sleepRadio() void {
@@ -361,7 +375,7 @@ fn app() void {
         }
 
         quiesce();
-        hal.lowpower.stopFor(nap);
+        stopFor(nap);
     }
 }
 
