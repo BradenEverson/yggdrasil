@@ -6,7 +6,7 @@ import select
 import struct
 import time
 import websocket
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import yggdrasil
 from rylr896 import RYLR896
@@ -142,18 +142,30 @@ class WebSocketStream(object):
 
 
 def describe_frame(frame):
-    if len(frame) < 18 or frame[0] != 0x72:
+    if len(frame) < 4:
         return f"(not a frame, {len(frame)} bytes)"
-    src = (frame[1] << 8) | frame[2]
-    dst = (frame[3] << 8) | frame[4]
-    flags = frame[10]
-    length = frame[11]
-    wake = (frame[12] << 16) | (frame[13] << 8) | frame[14]
-    period = ((frame[15] << 8) | frame[16]) * 100
-    hops = frame[17]
-    names = [n for i, n in enumerate(["ack", "bcast", "nack", "sn", "nesn"]) if flags & (1 << (7 - i))]
-    op = frame[18] if length else None
-    return f"{src}>{dst} len={length} op={op} hops={hops} period={period} wake={wake} [{','.join(names)}]"
+    flags, src, dst, hops = frame[0], frame[1], frame[2], frame[3]
+    i = 4
+    origin, dest, ttl, wake, period = src, dst, None, None, None
+    if flags & 0x08:
+        origin = frame[i] if i < len(frame) else None
+        i += 1
+    if flags & 0x04:
+        dest, ttl = (frame[i], frame[i + 1]) if i + 1 < len(frame) else (None, None)
+        i += 2
+    if flags & 0x02:
+        wake = int.from_bytes(frame[i:i + 2], "big") / 65536.0 if i + 1 < len(frame) else None
+        i += 2
+    if flags & 0x01:
+        period = int.from_bytes(frame[i:i + 2], "big") * 100 if i + 1 < len(frame) else None
+        i += 2
+    if i > len(frame):
+        return f"(truncated frame, {len(frame)} bytes)"
+    names = [n for b, n in ((0x80, "ack"), (0x40, "bcast"), (0x20, "sn"), (0x10, "nesn")) if flags & b]
+    op = frame[i] if i < len(frame) else None
+    route = f" {origin}=>{dest} ttl={ttl}" if (origin, dest) != (src, dst) or ttl is not None else ""
+    sched = "" if wake is None else f" wake={wake:.3f}" + ("" if period is None else f" period={period}")
+    return f"{src}>{dst}{route} len={len(frame) - i} op={op} hops={hops}{sched} [{','.join(names)}]"
 
 
 class Hub(object):
@@ -213,21 +225,41 @@ class Hub(object):
         op, payload = app
 
         if op == yggdrasil.OP_SENSOR_READINGS and not broadcast:
-            self.on_readings(origin, from_addr, payload)
+            self.on_readings(origin, from_addr, yggdrasil.parse_sensor_readings(payload), bytes(payload))
+        elif op == yggdrasil.OP_COMPACT_READINGS and not broadcast:
+            readings = yggdrasil.parse_compact_readings(payload)
+            self.on_readings(origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
+        elif op == yggdrasil.OP_BATCHED_READINGS and not broadcast:
+            entries = yggdrasil.parse_batched_readings(payload)
+            if not entries:
+                print(f"Malformed batch from Node {origin} (via {from_addr})")
+            for entry_origin, readings in entries:
+                self.on_readings(entry_origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
+        elif op == yggdrasil.OP_READING_SERIES and not broadcast:
+            records = yggdrasil.parse_reading_series(payload)
+            if not records:
+                print(f"Malformed series from Node {origin} (via {from_addr})")
+            for entry_origin, samples in records:
+                for age_s, readings in samples:
+                    wire = yggdrasil.encode_sensor_readings(readings + [("age_s", float(age_s))])
+                    self.on_readings(entry_origin, from_addr, readings, wire, age_s)
         elif op == yggdrasil.OP_HELLO and broadcast:
             print(f"Hello from {from_addr}")
 
-    def on_readings(self, origin, from_addr, payload):
-        readings = yggdrasil.parse_sensor_readings(payload)
+    def on_readings(self, origin, from_addr, readings, wire, age_s=0):
+        if not readings:
+            print(f"Malformed readings from Node {origin} (via {from_addr})")
+            return
         pretty = "  ".join(f"{n}={v:.2f}" if isinstance(v, float) else f"{n}={v}" for n, v in readings)
-        print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}): {pretty}")
+        age = f", {age_s} s ago" if age_s else ""
+        print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}{age}): {pretty}")
 
         if self.stream is not None:
-            self.stream.send(struct.pack(">H", origin) + bytes(payload))
+            self.stream.send(struct.pack(">H", origin) + wire)
             return
 
         row = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": (datetime.now() - timedelta(seconds=age_s)).isoformat(timespec="seconds"),
             "node_address": origin,
             "via": from_addr,
             "rssi": self.last_rssi,
@@ -291,7 +323,7 @@ def main():
     parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:8765/readings) to stream raw reading payloads to; CSV logging is used if omitted")
     parser.add_argument("--csv", default="log.csv", help="CSV file to append readings to when --ws is not given")
     parser.add_argument("--port", default="/dev/ttyTHS1", help="RYLR896 serial port")
-    parser.add_argument("--sf", type=int, default=9, help="LoRa spreading factor (7-12), must match every node")
+    parser.add_argument("--sf", type=int, default=7, help="LoRa spreading factor (7-12), must match every node")
     parser.add_argument("--bw", type=int, default=125000, choices=sorted(BANDWIDTH_CODES), help="LoRa bandwidth in Hz")
     parser.add_argument("--cr", type=int, default=1, choices=[1, 2, 3, 4], help="LoRa coding rate (1 = 4/5)")
     parser.add_argument("--preamble", type=int, default=4, choices=[4, 5, 6, 7], help="LoRa programmed preamble")

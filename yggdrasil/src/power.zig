@@ -2,18 +2,21 @@ const std = @import("std");
 const NetworkPacket = @import("network_packet.zig");
 pub const Radio = @import("lora.zig").Radio;
 
-pub const ACK_FRAME: usize = NetworkPacket.HEADER_LEN + 2;
-pub const MAX_WAKE_IN: u32 = std.math.maxInt(u24);
+pub const ACK_FRAME: usize = NetworkPacket.BASE_HEADER_LEN + 2;
 pub const PERIOD_UNIT_MS: u32 = 100;
+pub const GUARD_FIXED_MS: u32 = 10;
+pub const GUARD_SYMBOLS: u32 = 2;
+pub const SLACK_FIXED_MS: u32 = 25;
+pub const SLACK_SYMBOLS: u32 = 6;
 
 pub const Power = struct {
     period_ms: u32 = 0,
     window_ms: u32 = 0,
-    frame_budget: usize = 64,
-    guard_ms: u32 = 20,
+    frame_budget: usize = 32,
+    guard_ms: u32 = 0,
     drift_ppm: u32 = 40,
     radio_wake_ms: u32 = 100,
-    slack_ms: u32 = 50,
+    slack_ms: u32 = 0,
     max_hops: u8 = 32,
     reverse_route_hops: u8 = 8,
     join_backoff_max_ms: u32 = 30 * 60_000,
@@ -47,16 +50,26 @@ pub const Power = struct {
 
     pub fn windowMs(p: Power) u32 {
         if (p.window_ms != 0) return p.window_ms;
-        return 2 * p.guard_ms + p.backoffMs() + p.frameMs(p.frame_budget) + p.frameMs(ACK_FRAME) + p.slack_ms;
+        return 2 * p.baseGuardMs() + p.backoffMs() + p.frameMs(p.frame_budget) + p.frameMs(ACK_FRAME) + p.slackMs();
+    }
+
+    pub fn baseGuardMs(p: Power) u32 {
+        if (p.guard_ms != 0) return p.guard_ms;
+        return GUARD_FIXED_MS + p.radio.symbolsMs(GUARD_SYMBOLS);
+    }
+
+    pub fn slackMs(p: Power) u32 {
+        if (p.slack_ms != 0) return p.slack_ms;
+        return SLACK_FIXED_MS + p.radio.symbolsMs(SLACK_SYMBOLS);
     }
 
     pub fn lingerMs(p: Power, sent_len: usize) u32 {
-        return p.frameMs(sent_len) + p.frameMs(p.frame_budget) + 2 * p.guard_ms + p.slack_ms;
+        return p.frameMs(sent_len) + p.frameMs(p.frame_budget) + 2 * p.baseGuardMs() + p.slackMs();
     }
 
     pub fn guardMs(p: Power, elapsed_ms: u32) u32 {
         const drift: u64 = @as(u64, elapsed_ms) * p.drift_ppm / 1_000_000;
-        return p.guard_ms +| @as(u32, @intCast(@min(drift, std.math.maxInt(u32))));
+        return p.baseGuardMs() +| @as(u32, @intCast(@min(drift, std.math.maxInt(u32))));
     }
 
     pub fn scanMs(p: Power) u32 {
@@ -111,7 +124,22 @@ test "derived timings grow with spreading factor" {
     const slow: Power = .{ .period_ms = 60_000, .radio = .{ .spreading_factor = 12 } };
     try std.testing.expect(fast.windowMs() < slow.windowMs());
     try std.testing.expect(fast.windowMs() < 1000);
-    try std.testing.expectEqual(@as(u32, 20), fast.guardMs(0));
-    try std.testing.expectEqual(@as(u32, 22), fast.guardMs(60_000));
+    try std.testing.expectEqual(@as(u32, 13), fast.guardMs(0));
+    try std.testing.expectEqual(@as(u32, 15), fast.guardMs(60_000));
+    try std.testing.expectEqual(@as(u32, 32), fast.slackMs());
     try std.testing.expectEqual(@as(u16, 600), fast.advertisedPeriod());
+}
+
+test "derived guard and slack keep the sf9 margins and scale with symbol time" {
+    const sf9: Power = .{ .radio = .{ .spreading_factor = 9 } };
+    try std.testing.expectEqual(@as(u32, 19), sf9.baseGuardMs());
+    try std.testing.expectEqual(@as(u32, 50), sf9.slackMs());
+
+    const sf12: Power = .{ .radio = .{ .spreading_factor = 12 } };
+    try std.testing.expectEqual(@as(u32, 76), sf12.baseGuardMs());
+    try std.testing.expectEqual(@as(u32, 222), sf12.slackMs());
+
+    const pinned: Power = .{ .guard_ms = 20, .slack_ms = 50 };
+    try std.testing.expectEqual(@as(u32, 20), pinned.baseGuardMs());
+    try std.testing.expectEqual(@as(u32, 50), pinned.slackMs());
 }

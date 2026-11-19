@@ -3,6 +3,9 @@ import os
 import struct
 import time
 
+BROADCAST_ADDR = 0xFF
+MAX_ADDRESS = 0xFE
+
 PRIORITY_HIGH = 0
 PRIORITY_LOW = 10
 
@@ -12,20 +15,31 @@ OP_IM_A_ROOT = 1
 OP_CONFIGURE_STREAM = 2
 OP_TOPOLOGY_INFO = 3
 OP_SENSOR_READINGS = 4
+OP_COMPACT_READINGS = 5
+OP_BATCHED_READINGS = 6
+OP_READING_SERIES = 7
 
 _VALUE_FORMATS = ["B", "H", "I", "Q", "b", "h", "i", "q", "f", "d"]
+_FLOAT32 = _VALUE_FORMATS.index("f")
+
+_COMPACT_FIELDS = [
+    ("t", ">h", lambda v: v / 100.0 * 9.0 / 5.0 + 32.0),
+    ("p", ">H", lambda v: v / 10.0),
+    ("h", ">H", lambda v: v / 100.0),
+    ("g", ">H", lambda v: 2.0 ** (v / 2048.0)),
+]
 
 _WRITE_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
 _PACKET_CB = ctypes.CFUNCTYPE(
     None,
-    ctypes.c_uint16,
-    ctypes.c_uint16,
-    ctypes.c_uint16,
+    ctypes.c_uint8,
+    ctypes.c_uint8,
+    ctypes.c_uint8,
     ctypes.c_bool,
     ctypes.POINTER(ctypes.c_uint8),
     ctypes.c_size_t,
 )
-_LOST_CB = ctypes.CFUNCTYPE(None, ctypes.c_uint16)
+_LOST_CB = ctypes.CFUNCTYPE(None, ctypes.c_uint8)
 
 
 def _find_library():
@@ -46,7 +60,7 @@ def _find_library():
 
 def _load(path):
     lib = ctypes.CDLL(path)
-    lib.ygg_init.argtypes = [ctypes.c_uint16, ctypes.c_bool, _WRITE_CB, _PACKET_CB, _LOST_CB]
+    lib.ygg_init.argtypes = [ctypes.c_uint8, ctypes.c_bool, _WRITE_CB, _PACKET_CB, _LOST_CB]
     lib.ygg_init.restype = None
     lib.ygg_configure_power.argtypes = [ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint8]
     lib.ygg_configure_power.restype = None
@@ -72,7 +86,7 @@ def _load(path):
     lib.ygg_announce_topology.restype = None
     lib.ygg_root_address.argtypes = []
     lib.ygg_root_address.restype = ctypes.c_int32
-    lib.ygg_send.argtypes = [ctypes.c_uint16, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint8]
+    lib.ygg_send.argtypes = [ctypes.c_uint8, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint8]
     lib.ygg_send.restype = ctypes.c_int
     lib.ygg_neighbor_count.argtypes = []
     lib.ygg_neighbor_count.restype = ctypes.c_uint32
@@ -89,6 +103,8 @@ class Node(object):
         self.on_packet = on_packet
         self.on_neighbor_lost = on_neighbor_lost
         self._t0 = time.monotonic()
+        if not 0 <= address <= MAX_ADDRESS:
+            raise ValueError(f"address must be 0-{MAX_ADDRESS}, got {address}")
 
         self._write_cb = _WRITE_CB(self._c_write)
         self._packet_cb = _PACKET_CB(self._c_packet)
@@ -188,3 +204,97 @@ def parse_sensor_readings(payload):
         readings.append((name, value))
         i += 1 + entry_len
     return readings
+
+
+def _compact_len(mask):
+    if mask >> len(_COMPACT_FIELDS):
+        return None
+    return 1 + 2 * bin(mask).count("1")
+
+
+def parse_compact_readings(payload):
+    if not payload:
+        return []
+    mask = payload[0]
+    if len(payload) != _compact_len(mask):
+        return []
+    readings = []
+    i = 1
+    for bit, (name, fmt, decode) in enumerate(_COMPACT_FIELDS):
+        if mask & (1 << bit):
+            (raw,) = struct.unpack(fmt, payload[i:i + 2])
+            readings.append((name, decode(raw)))
+            i += 2
+    return readings
+
+
+def encode_sensor_readings(readings):
+    out = bytearray()
+    for name, value in readings:
+        raw = name.encode()
+        out.append(1 + len(raw) + 4)
+        out.append(_FLOAT32)
+        out += raw
+        out += struct.pack(">f", value)
+    return bytes(out)
+
+
+def parse_batched_readings(payload):
+    entries = []
+    i = 0
+    while i < len(payload):
+        if i + 2 > len(payload):
+            return []
+        size = _compact_len(payload[i + 1])
+        if size is None or i + 1 + size > len(payload):
+            return []
+        readings = parse_compact_readings(payload[i + 1:i + 1 + size])
+        if not readings:
+            return []
+        entries.append((payload[i], readings))
+        i += 1 + size
+    return entries
+
+
+_SERIES_HEADER_LEN = 6
+_SERIES_INTERVAL_UNIT_S = 10
+_SERIES_ESCAPE = 0x80
+
+
+def parse_reading_series(payload):
+    records = []
+    i = 0
+    while i < len(payload):
+        if i + _SERIES_HEADER_LEN > len(payload):
+            return []
+        origin, mask, count, interval = payload[i], payload[i + 1], payload[i + 2], payload[i + 3]
+        if mask == 0 or mask >> len(_COMPACT_FIELDS) or count == 0:
+            return []
+        age_s = int.from_bytes(payload[i + 4:i + 6], "big")
+        interval_s = interval * _SERIES_INTERVAL_UNIT_S
+        fields = [(bit, field) for bit, field in enumerate(_COMPACT_FIELDS) if mask & (1 << bit)]
+        i += _SERIES_HEADER_LEN
+        values = [0] * len(fields)
+        samples = []
+        for index in range(count):
+            for slot in range(len(fields)):
+                if index == 0 or payload[i] == _SERIES_ESCAPE:
+                    if index != 0:
+                        i += 1
+                    if i + 2 > len(payload):
+                        return []
+                    values[slot] = int.from_bytes(payload[i:i + 2], "big")
+                    i += 2
+                else:
+                    delta = payload[i] - 256 if payload[i] > 127 else payload[i]
+                    values[slot] = (values[slot] + delta) & 0xFFFF
+                    i += 1
+                if i > len(payload):
+                    return []
+            readings = []
+            for (bit, (name, fmt, decode)), raw in zip(fields, values):
+                (value,) = struct.unpack(fmt, raw.to_bytes(2, "big"))
+                readings.append((name, decode(value)))
+            samples.append((age_s + (count - 1 - index) * interval_s, readings))
+        records.append((origin, samples))
+    return records

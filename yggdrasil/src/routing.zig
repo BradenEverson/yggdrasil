@@ -4,32 +4,33 @@
 const std = @import("std");
 
 pub const MAX_NEIGHBORS = @import("message_queue.zig").MAX_NEIGHBORS;
+const Address = @import("network_packet.zig").Address;
 
 pub const LinkState = struct {
-    addr: u16 = 0,
+    addr: Address = 0,
     seq: u16 = 0,
-    neighbors: [MAX_NEIGHBORS]u16 = undefined,
+    neighbors: [MAX_NEIGHBORS]Address = undefined,
     num_neighbors: usize = 0,
     heard_at: u32 = 0,
     flood_pending: bool = false,
     flood_at: u32 = 0,
 
-    pub fn links(ls: *const LinkState) []const u16 {
+    pub fn links(ls: *const LinkState) []const Address {
         return ls.neighbors[0..ls.num_neighbors];
     }
 
-    pub fn lists(ls: *const LinkState, addr: u16) bool {
+    pub fn lists(ls: *const LinkState, addr: Address) bool {
         return contains(ls.links(), addr);
     }
 };
 
 pub const Path = struct {
-    dest: u16,
-    first_hop: u16,
+    dest: Address,
+    first_hop: Address,
     cost: u8,
 };
 
-fn contains(addrs: []const u16, addr: u16) bool {
+fn contains(addrs: []const Address, addr: Address) bool {
     for (addrs) |a| {
         if (a == addr) return true;
     }
@@ -52,21 +53,21 @@ pub const TopologyGraph = struct {
         return graph.nodes[0..graph.num_nodes];
     }
 
-    pub fn get(graph: *TopologyGraph, addr: u16) ?*LinkState {
+    pub fn get(graph: *TopologyGraph, addr: Address) ?*LinkState {
         for (graph.all()) |*ls| {
             if (ls.addr == addr) return ls;
         }
         return null;
     }
 
-    fn getConst(graph: *const TopologyGraph, addr: u16) ?*const LinkState {
+    fn getConst(graph: *const TopologyGraph, addr: Address) ?*const LinkState {
         for (graph.nodes[0..graph.num_nodes]) |*ls| {
             if (ls.addr == addr) return ls;
         }
         return null;
     }
 
-    pub fn update(graph: *TopologyGraph, addr: u16, seq: u16, neighbors: []const u16, now: u32) Error!?*LinkState {
+    pub fn update(graph: *TopologyGraph, addr: Address, seq: u16, neighbors: []const Address, now: u32) Error!?*LinkState {
         const entry = if (graph.get(addr)) |existing| blk: {
             if (!seqNewer(seq, existing.seq))
                 return null;
@@ -88,7 +89,7 @@ pub const TopologyGraph = struct {
         return entry;
     }
 
-    pub fn remove(graph: *TopologyGraph, addr: u16) void {
+    pub fn remove(graph: *TopologyGraph, addr: Address) void {
         for (graph.all(), 0..) |ls, i| {
             if (ls.addr != addr) continue;
             graph.num_nodes -= 1;
@@ -97,7 +98,7 @@ pub const TopologyGraph = struct {
         }
     }
 
-    fn linked(graph: *const TopologyGraph, self_addr: u16, own: []const u16, u: u16, v: u16) bool {
+    fn linked(graph: *const TopologyGraph, self_addr: Address, own: []const Address, u: Address, v: Address) bool {
         if (u == self_addr) return contains(own, v);
         if (v == self_addr) return contains(own, u);
 
@@ -111,14 +112,14 @@ pub const TopologyGraph = struct {
         return uv or vu;
     }
 
-    pub fn shortestPaths(graph: *const TopologyGraph, self_addr: u16, own: []const u16, out: []Path) usize {
+    pub fn shortestPaths(graph: *const TopologyGraph, self_addr: Address, own: []const Address, out: []Path) usize {
         const INF = std.math.maxInt(u16);
 
-        var addrs: [MAX_VERTICES]u16 = undefined;
+        var addrs: [MAX_VERTICES]Address = undefined;
         var num: usize = 0;
 
         const add = struct {
-            fn f(list: *[MAX_VERTICES]u16, len: *usize, addr: u16) void {
+            fn f(list: *[MAX_VERTICES]Address, len: *usize, addr: Address) void {
                 if (len.* >= MAX_VERTICES or contains(list[0..len.*], addr)) return;
                 list[len.*] = addr;
                 len.* += 1;
@@ -133,7 +134,7 @@ pub const TopologyGraph = struct {
         }
 
         var dist: [MAX_VERTICES]u16 = @splat(INF);
-        var first: [MAX_VERTICES]u16 = undefined;
+        var first: [MAX_VERTICES]Address = undefined;
         var done: [MAX_VERTICES]bool = @splat(false);
         dist[0] = 0;
 
@@ -167,7 +168,7 @@ pub const TopologyGraph = struct {
 
 pub const ForwardingEntry = struct {
     mq_idx: usize = 0,
-    dest: u16 = 0,
+    dest: Address = 0,
     hops: u8 = 1,
 };
 
@@ -178,7 +179,7 @@ pub const Route = struct {
 
 pub const MessageQueueMap = struct {
     mq_idx: usize = 0,
-    addr: u16 = 0,
+    addr: Address = 0,
     sn: bool = false,
     nesn: bool = false,
     ack_pending: bool = false,
@@ -207,7 +208,7 @@ pub const ForwardingTable = struct {
 
     pub const Error = error{ TooManyNeighbors, TooManyRoutes };
 
-    pub fn registerNeighbor(ft: *ForwardingTable, addr: u16, mq_idx: usize) Error!*MessageQueueMap {
+    pub fn registerNeighbor(ft: *ForwardingTable, addr: Address, mq_idx: usize) Error!*MessageQueueMap {
         if (ft.neighborByAddr(addr)) |existing| {
             existing.mq_idx = mq_idx;
             return existing;
@@ -222,7 +223,7 @@ pub const ForwardingTable = struct {
         return entry;
     }
 
-    pub fn neighborByAddr(ft: *ForwardingTable, addr: u16) ?*MessageQueueMap {
+    pub fn neighborByAddr(ft: *ForwardingTable, addr: Address) ?*MessageQueueMap {
         for (ft.output_map[0..ft.num_registered_output_map]) |*entry| {
             if (entry.addr == addr) return entry;
         }
@@ -236,7 +237,7 @@ pub const ForwardingTable = struct {
         return null;
     }
 
-    pub fn removeNeighbor(ft: *ForwardingTable, addr: u16) void {
+    pub fn removeNeighbor(ft: *ForwardingTable, addr: Address) void {
         for (ft.output_map[0..ft.num_registered_output_map], 0..) |entry, i| {
             if (entry.addr != addr) continue;
 
@@ -262,7 +263,7 @@ pub const ForwardingTable = struct {
         return null;
     }
 
-    pub fn setRoute(ft: *ForwardingTable, dest: u16, mq_idx: usize, hops: u8) Error!void {
+    pub fn setRoute(ft: *ForwardingTable, dest: Address, mq_idx: usize, hops: u8) Error!void {
         const clamped = @max(hops, 1);
 
         for (ft.forwarding_table[0..ft.num_forwards]) |*entry| {
@@ -280,7 +281,7 @@ pub const ForwardingTable = struct {
         ft.num_forwards += 1;
     }
 
-    pub fn removeRoute(ft: *ForwardingTable, dest: u16) void {
+    pub fn removeRoute(ft: *ForwardingTable, dest: Address) void {
         for (ft.forwarding_table[0..ft.num_forwards], 0..) |entry, i| {
             if (entry.dest == dest) {
                 ft.num_forwards -= 1;
@@ -290,7 +291,7 @@ pub const ForwardingTable = struct {
         }
     }
 
-    pub fn removeRoutesExcept(ft: *ForwardingTable, keep: ?u16) void {
+    pub fn removeRoutesExcept(ft: *ForwardingTable, keep: ?Address) void {
         var i = ft.num_forwards;
         while (i > 0) {
             i -= 1;
@@ -300,7 +301,7 @@ pub const ForwardingTable = struct {
         }
     }
 
-    pub fn route(ft: *ForwardingTable, dest: u16) ?Route {
+    pub fn route(ft: *ForwardingTable, dest: Address) ?Route {
         if (ft.neighborByAddr(dest)) |neighbor|
             return .{ .neighbor = neighbor, .hops = 1 };
 
@@ -314,7 +315,7 @@ pub const ForwardingTable = struct {
         return null;
     }
 
-    pub fn nextHop(ft: *ForwardingTable, dest: u16) ?*MessageQueueMap {
+    pub fn nextHop(ft: *ForwardingTable, dest: Address) ?*MessageQueueMap {
         const found = ft.route(dest) orelse return null;
         return found.neighbor;
     }
@@ -331,13 +332,13 @@ test "next hop prefers direct neighbors, then forwarding entries" {
     try ft.setRoute(30, 1, 3);
     try ft.setRoute(10, 1, 2);
 
-    try std.testing.expectEqual(@as(u16, 10), ft.nextHop(10).?.addr);
-    try std.testing.expectEqual(@as(u16, 20), ft.nextHop(30).?.addr);
+    try std.testing.expectEqual(@as(Address, 10), ft.nextHop(10).?.addr);
+    try std.testing.expectEqual(@as(Address, 20), ft.nextHop(30).?.addr);
     try std.testing.expectEqual(@as(u8, 3), ft.route(30).?.hops);
     try std.testing.expect(ft.nextHop(40) == null);
 
     try ft.setRoute(30, 0, 0);
-    try std.testing.expectEqual(@as(u16, 10), ft.nextHop(30).?.addr);
+    try std.testing.expectEqual(@as(Address, 10), ft.nextHop(30).?.addr);
     try std.testing.expectEqual(@as(u8, 1), ft.route(30).?.hops);
     try std.testing.expectEqual(@as(u8, 1), ft.route(10).?.hops);
 
@@ -357,11 +358,11 @@ test "removing a neighbor drops routes through it" {
 
     try std.testing.expect(ft.neighborByAddr(10) == null);
     try std.testing.expect(ft.nextHop(30) == null);
-    try std.testing.expectEqual(@as(u16, 20), ft.nextHop(40).?.addr);
+    try std.testing.expectEqual(@as(Address, 20), ft.nextHop(40).?.addr);
     try std.testing.expectEqual(@as(?usize, 0), ft.freeSlot());
 }
 
-fn pathTo(paths: []const Path, dest: u16) ?Path {
+fn pathTo(paths: []const Path, dest: Address) ?Path {
     for (paths) |p| {
         if (p.dest == dest) return p;
     }

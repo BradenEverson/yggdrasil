@@ -44,6 +44,14 @@ pub const Config = struct {
     heater_dur_ms: u16 = 150,
 };
 
+pub const LOW_POWER: Config = .{
+    .temp_os = .x1,
+    .press_os = .x1,
+    .hum_os = .x1,
+    .filter = .off,
+    .gas_enabled = false,
+};
+
 pub const Reading = struct {
     temperature_c: f32,
     pressure_pa: f32,
@@ -172,10 +180,16 @@ pub const Bme688 = struct {
     }
 
     pub fn measure(self: *Bme688) Bme688Error!Reading {
-        try self.triggerForced();
-
+        try self.start();
         hal.timer.delayMs(self.estimateDurationMs());
+        return self.finish();
+    }
 
+    pub fn start(self: *Bme688) Bme688Error!void {
+        try self.triggerForced();
+    }
+
+    pub fn finish(self: *Bme688) Bme688Error!Reading {
         var b: [FIELD_LEN]u8 = undefined;
         var waited: u32 = 0;
         while (true) {

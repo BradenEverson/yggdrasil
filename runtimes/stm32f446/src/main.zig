@@ -11,13 +11,17 @@ const lora_uart: hal.uart.Uart = .usart1;
 const BAUD_RATE = 115200;
 const LORA_TX_SIZE = 256;
 const LORA_LINE_SIZE = 32;
-const YGG_RX_SIZE = 64;
+const YGG_RX_SIZE = yggdrasil.NetworkPacket.MAX_FRAME_LEN;
 const MAX_WRITES_PER_PASS = 4;
 const FAIL_RETRY_MS: u32 = 60_000;
 
 const NETWORK_ID: u16 = 5;
-const NODE_ADDR: u16 = node_config.node_addr;
+const NODE_ADDR: yggdrasil.Address = node_config.node_addr;
 const PERIOD_MS: u32 = node_config.period_ms;
+const SAMPLE_MS: u32 = node_config.sample_ms;
+const SAMPLE_INTERVAL_S: u16 = @intCast(SAMPLE_MS / 1000);
+const SAMPLES_PER_SEND: usize = @max(PERIOD_MS / SAMPLE_MS, 1);
+const MAX_SERIES: usize = @min(@max(2 * SAMPLES_PER_SEND, 4), 32);
 const RADIO_BROADCAST_ADDR: u16 = 0;
 
 const RADIO: yggdrasil.lora.Radio = .{
@@ -39,6 +43,9 @@ const POWER: yggdrasil.Power = .{
 comptime {
     if (PERIOD_MS % yggdrasil.power.PERIOD_UNIT_MS != 0 or PERIOD_MS == 0)
         @compileError("period_ms must be a nonzero multiple of 100");
+    if (SAMPLE_MS == 0 or SAMPLE_MS % (yggdrasil.AppPacket.ReadingSeries.INTERVAL_UNIT_S * 1000) != 0 or
+        SAMPLE_MS > @as(u32, yggdrasil.AppPacket.ReadingSeries.MAX_INTERVAL_S) * 1000)
+        @compileError("sample_ms must be a nonzero multiple of 10000, at most 2550000");
 }
 
 const used_pins = [_]hal.gpio.Pin{
@@ -59,7 +66,13 @@ var ygg_rx: [YGG_RX_SIZE]u8 = undefined;
 
 var lora: Rylr = undefined;
 var ygg: yggdrasil.Yggdrasil = undefined;
+var sensor: bme688.Bme688 = undefined;
 var radio_awake = false;
+var next_sample: u32 = 0;
+
+var series: [MAX_SERIES]yggdrasil.AppPacket.CompactReadings = undefined;
+var series_at: [MAX_SERIES]u32 = undefined;
+var series_len: usize = 0;
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     if (!node_config.log) return;
@@ -70,15 +83,13 @@ fn radioRead(buf: []u8) yggdrasil.YggdrasilError![]u8 {
     return lora.read(buf);
 }
 
-fn traceFrame(dir: []const u8, f: []const u8) void {
-    if (!node_config.trace or f.len < yggdrasil.NetworkPacket.HEADER_LEN) return;
-    const from = (@as(u16, f[1]) << 8) | f[2];
-    const to = (@as(u16, f[3]) << 8) | f[4];
-    log("{s} {}>{} len={} f={x} t={}\r\n", .{ dir, from, to, f[11], f[10], hal.timer.millis() });
+fn traceFrame(dir: []const u8, f: []const u8, len: usize) void {
+    if (!node_config.trace or f.len < yggdrasil.NetworkPacket.BASE_HEADER_LEN) return;
+    log("{s} {}>{} len={} f={x} t={}\r\n", .{ dir, f[1], f[2], len, f[0], hal.timer.millis() });
 }
 
 fn radioWrite(buf: []u8) yggdrasil.YggdrasilError!void {
-    traceFrame("tx", buf);
+    traceFrame("tx", buf, buf.len);
     lora.sendData(RADIO_BROADCAST_ADDR, buf) catch |e| {
         log("send failed: {s}\r\n", .{@errorName(e)});
         return error.WriteFailed;
@@ -91,7 +102,7 @@ fn onPacket(packet: yggdrasil.NetworkPacket) void {
     log("rx {} via {} {s}\r\n", .{ packet.origin, packet.from, op });
 }
 
-fn onNeighborLost(addr: u16) void {
+fn onNeighborLost(addr: yggdrasil.Address) void {
     log("lost neighbor {}\r\n", .{addr});
 }
 
@@ -113,7 +124,7 @@ fn fail(what: []const u8, err: anyerror) noreturn {
     log("{s} failed: {s}\r\n", .{ what, @errorName(err) });
     sleepRadio();
     quiesce();
-    if (hal.rtc.ready) hal.lowpower.stopFor(FAIL_RETRY_MS);
+    if (hal.rtc.ready) stopFor(FAIL_RETRY_MS);
     hal.reset();
 }
 
@@ -148,6 +159,20 @@ fn quiesce() void {
     hal.uart.flush(lora_uart);
 }
 
+const USART_AF: u4 = 7;
+const I2C_AF: u4 = 4;
+
+fn stopFor(ms: u32) void {
+    hal.gpio.analogMask(.a, (1 << 9) | (1 << 10));
+    hal.gpio.analogMask(.b, (1 << 8) | (1 << 9));
+    hal.lowpower.stopFor(ms);
+    hal.gpio.alternate(.b, 8, I2C_AF);
+    hal.gpio.alternate(.b, 9, I2C_AF);
+    hal.gpio.alternate(.a, 9, USART_AF);
+    hal.gpio.alternate(.a, 10, USART_AF);
+    hal.gpio.pullUp(.a, 10);
+}
+
 fn sleepRadio() void {
     if (!node_config.radio_sleep or !radio_awake) return;
     lora.sleep() catch |e| {
@@ -162,6 +187,15 @@ var seen_frames: u32 = 0;
 fn wakeRadio() void {
     if (radio_awake) return;
     const start = hal.timer.millis();
+    const slot = ygg.rootAddress() != null and @as(i32, @bitCast(next_sample -% start)) <= @as(i32, @intCast(SAMPLE_MS / 2));
+    const sampling = slot and blk: {
+        sensor.start() catch |e| {
+            log("measure failed: {s}\r\n", .{@errorName(e)});
+            break :blk false;
+        };
+        break :blk true;
+    };
+    if (slot) next_sample = start +% SAMPLE_MS;
     lora.wake() catch |e| {
         log("radio wake failed: {s}\r\n", .{@errorName(e)});
         lora.reset();
@@ -170,7 +204,15 @@ fn wakeRadio() void {
     };
     radio_awake = true;
     const took = hal.timer.millis() -% start;
-    log("radio wake took {} ms\r\n", .{took});
+    const w = lora.last_wake;
+    log("radio wake took {} ms attempts={} at={} params={} power={}\r\n", .{ took, w.attempts, w.at_ms, w.params_ms, w.power_ms });
+
+    if (sampling) {
+        if (sensor.finish()) |r| {
+            record(r, start);
+        } else |e| log("measure failed: {s}\r\n", .{@errorName(e)});
+    }
+    if (series_len >= SAMPLES_PER_SEND) flushSeries();
 }
 
 fn serviceRadio() void {
@@ -178,19 +220,17 @@ fn serviceRadio() void {
     if (lora.received != seen_frames) {
         seen_frames = lora.received;
         const f = lora.last_rx[0..@min(lora.last_rx_len, Rylr.FRAME_PEEK)];
-        traceFrame("rx", f);
+        traceFrame("rx", f, lora.last_rx_len);
         logSignal(f);
     }
 }
 
 fn logSignal(f: []const u8) void {
-    if (f.len < 5) {
+    if (f.len < yggdrasil.NetworkPacket.BASE_HEADER_LEN) {
         log("sig ? rssi={} snr={}\r\n", .{ lora.last_rssi, lora.last_snr });
         return;
     }
-    const from = (@as(u16, f[1]) << 8) | f[2];
-    const to = (@as(u16, f[3]) << 8) | f[4];
-    log("sig {}>{} rssi={} snr={}\r\n", .{ from, to, lora.last_rssi, lora.last_snr });
+    log("sig {}>{} rssi={} snr={}\r\n", .{ f[1], f[2], lora.last_rssi, lora.last_snr });
 }
 
 fn configureRadio() Rylr.RylrError!void {
@@ -227,7 +267,7 @@ fn app() void {
         .speed = .standard,
     });
 
-    var sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, .{}) catch |e| fail("BME688 init", e);
+    sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, bme688.LOW_POWER) catch |e| fail("BME688 init", e);
 
     lora = .{
         .uart = lora_uart,
@@ -269,17 +309,17 @@ fn app() void {
 
     log("window {} ms\r\n", .{POWER.windowMs()});
 
-    var known_root: ?u16 = null;
-    var next_sample: u32 = hal.timer.millis() +% random(PERIOD_MS);
+    var known_root: ?yggdrasil.Address = null;
+    next_sample = hal.timer.millis() +% random(SAMPLE_MS);
 
     while (true) {
         const now = hal.timer.millis();
 
-        const overdue = reached(now, next_sample +% PERIOD_MS / 4);
+        const overdue = reached(now, next_sample +% SAMPLE_MS / 4);
         if (reached(now, next_sample) and (overdue or ygg.idleFor() != 0)) {
-            next_sample +%= PERIOD_MS;
-            if (reached(now, next_sample)) next_sample = now +% PERIOD_MS;
-            sample(&ygg, &sensor);
+            next_sample +%= SAMPLE_MS;
+            if (reached(now, next_sample)) next_sample = now +% SAMPLE_MS;
+            sample();
         }
 
         if (ygg.idleFor() == 0) {
@@ -335,38 +375,72 @@ fn app() void {
         }
 
         quiesce();
-        hal.lowpower.stopFor(nap);
+        stopFor(nap);
     }
 }
 
-fn sample(node: *yggdrasil.Yggdrasil, sensor: *bme688.Bme688) void {
-    if (node.rootAddress() == null) return;
-
+fn sample() void {
+    if (ygg.rootAddress() == null) return;
+    const at = hal.timer.millis();
     const r = sensor.measure() catch |e| {
         log("measure failed: {s}\r\n", .{@errorName(e)});
         return;
     };
-
-    var readings_buf: [yggdrasil.NetworkPacket.MAX_PAYLOAD_SIZE - 1]u8 = undefined;
-    var readings = yggdrasil.AppPacket.SensorReadingWriter{ .buf = &readings_buf };
-
-    addReadings(&readings, r) catch |e| {
-        log("encode failed: {s}\r\n", .{@errorName(e)});
-        return;
-    };
-
-    const packet: yggdrasil.AppPacket = .{ .op = .sensor_readings, .payload = readings.written() };
-
-    node.sendAppToRoot(packet, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
-        log("send failed: {s}\r\n", .{@errorName(e)});
-    };
+    record(r, at);
 }
 
-fn addReadings(readings: *yggdrasil.AppPacket.SensorReadingWriter, r: bme688.Reading) error{NoSpaceLeft}!void {
-    try readings.add("t", .{ .float32 = r.temperatureF() });
-    try readings.add("p", .{ .float32 = r.pressureHpa() });
-    try readings.add("h", .{ .float32 = r.humidity_pct });
+fn record(r: bme688.Reading, at: u32) void {
+    if (series_len == MAX_SERIES) dropSamples(1);
+    series[series_len] = compactReadings(r);
+    series_at[series_len] = at;
+    series_len += 1;
+}
 
-    if (r.gas_valid and r.heater_stable)
-        try readings.add("g", .{ .float32 = r.gas_resistance_ohm });
+fn dropSamples(n: usize) void {
+    std.mem.copyForwards(yggdrasil.AppPacket.CompactReadings, series[0 .. series_len - n], series[n..series_len]);
+    std.mem.copyForwards(u32, series_at[0 .. series_len - n], series_at[n..series_len]);
+    series_len -= n;
+}
+
+fn evenlySpaced(prev: u32, next: u32) bool {
+    const gap = next -% prev;
+    const off = if (gap > SAMPLE_MS) gap - SAMPLE_MS else SAMPLE_MS - gap;
+    return off <= SAMPLE_MS / 4;
+}
+
+fn flushSeries() void {
+    if (series_len == 0 or ygg.rootAddress() == null) return;
+    const Series = yggdrasil.AppPacket.ReadingSeries;
+    const now = hal.timer.millis();
+
+    var buf: [yggdrasil.NetworkPacket.MAX_PAYLOAD_SIZE - 1]u8 = undefined;
+    var n: usize = 0;
+    var start: usize = 0;
+    var records: usize = 0;
+    while (start < series_len) {
+        var end = start + 1;
+        while (end < series_len and evenlySpaced(series_at[end - 1], series_at[end])) end += 1;
+        const age_s: u16 = @intCast(@min((now -% series_at[end - 1]) / 1000, std.math.maxInt(u16)));
+        const rec = Series.write(NODE_ADDR, SAMPLE_INTERVAL_S, age_s, series[start..end], buf[n..]) catch break;
+        n += rec.len;
+        records += 1;
+        start = end;
+    }
+    if (start == 0) return;
+
+    ygg.sendAppToRoot(.{ .op = .reading_series, .payload = buf[0..n] }, yggdrasil.MessageQueue.PRIORITY_LOW) catch |e| {
+        log("send failed: {s}\r\n", .{@errorName(e)});
+        return;
+    };
+    log("queued {} samples in {} records, {} bytes\r\n", .{ start, records, n });
+    dropSamples(start);
+}
+
+fn compactReadings(r: bme688.Reading) yggdrasil.AppPacket.CompactReadings {
+    const C = yggdrasil.AppPacket.CompactReadings;
+    return .{
+        .centi_celsius = C.temperature(r.temperature_c),
+        .deci_hpa = C.pressure(r.pressure_pa),
+        .centi_pct = C.humidity(r.humidity_pct),
+    };
 }

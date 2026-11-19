@@ -6,10 +6,11 @@ const ygg = @import("yggdrasil");
 const Yggdrasil = ygg.Yggdrasil;
 const NetworkPacket = ygg.NetworkPacket;
 const YggdrasilError = ygg.YggdrasilError;
+const Address = ygg.Address;
 
 pub const WriteCallback = *const fn (ptr: [*]const u8, len: usize) callconv(.c) c_int;
-pub const PacketCallback = *const fn (origin: u16, from: u16, dest: u16, broadcast: bool, ptr: [*]const u8, len: usize) callconv(.c) void;
-pub const NeighborLostCallback = *const fn (addr: u16) callconv(.c) void;
+pub const PacketCallback = *const fn (origin: Address, from: Address, dest: Address, broadcast: bool, ptr: [*]const u8, len: usize) callconv(.c) void;
+pub const NeighborLostCallback = *const fn (addr: Address) callconv(.c) void;
 
 var node: Yggdrasil = undefined;
 var initialized = false;
@@ -20,17 +21,13 @@ var packet_cb: ?PacketCallback = null;
 var lost_cb: ?NeighborLostCallback = null;
 
 var now_ms: u32 = 0;
-var staged: []const u8 = &.{};
 
 fn clock() u32 {
     return now_ms;
 }
 
 fn readBytes(buf: []u8) YggdrasilError![]u8 {
-    const n = @min(buf.len, staged.len);
-    @memcpy(buf[0..n], staged[0..n]);
-    staged = staged[n..];
-    return buf[0..n];
+    return buf[0..0];
 }
 
 fn writeBytes(buf: []u8) YggdrasilError!void {
@@ -44,12 +41,12 @@ fn onPacket(packet: NetworkPacket) void {
     cb(packet.origin, packet.from, packet.dest, packet.broadcast, body.ptr, body.len);
 }
 
-fn onNeighborLost(addr: u16) void {
+fn onNeighborLost(addr: Address) void {
     if (lost_cb) |cb| cb(addr);
 }
 
 export fn ygg_init(
-    address: u16,
+    address: Address,
     is_root: bool,
     write: ?WriteCallback,
     packet: ?PacketCallback,
@@ -114,8 +111,7 @@ export fn ygg_set_time(ms: u32) void {
 
 export fn ygg_feed(ptr: [*]const u8, len: usize) c_int {
     if (!initialized) return -1;
-    staged = ptr[0..len];
-    while (staged.len > 0) node.readStream() catch {};
+    node.handleFrame(ptr[0..len]);
     return 0;
 }
 
@@ -144,7 +140,7 @@ export fn ygg_root_address() i32 {
     return node.rootAddress() orelse -1;
 }
 
-export fn ygg_send(dest: u16, ptr: [*]const u8, len: usize, priority: u8) c_int {
+export fn ygg_send(dest: Address, ptr: [*]const u8, len: usize, priority: u8) c_int {
     if (!initialized) return -1;
     node.send(dest, ptr[0..len], priority) catch |e| return switch (e) {
         error.NoRoute => 1,
