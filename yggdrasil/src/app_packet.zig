@@ -168,7 +168,7 @@ pub const CompactReadings = struct {
     }
 
     fn bit(field: Field) u8 {
-        return @as(u8, 1) << @intFromEnum(field);
+        return @as(u8, 1) << @backingInt(field);
     }
 
     pub fn write(r: CompactReadings, buf: *[MAX_LEN]u8) []const u8 {
