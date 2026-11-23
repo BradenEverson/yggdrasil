@@ -1,46 +1,36 @@
-//! UARRRRRRT
-
 const std = @import("std");
 const gpio = @import("gpio.zig");
 const rcc = @import("rcc.zig");
+const RxRing = @import("../common/rx_ring.zig").RxRing;
 
-pub const Uart = enum { usart1, usart2, usart3, uart4, uart5, usart6 };
+pub const Uart = enum { usart1, usart2, usart3, usart4 };
 
 const Signal = enum { tx, rx };
 
 const PinOption = struct { uart: Uart, signal: Signal, port: gpio.Port, pin: u4, af: u4 };
 
 const pin_options = [_]PinOption{
-    // USART1 (AF7)
     .{ .uart = .usart1, .signal = .tx, .port = .a, .pin = 9, .af = 7 },
     .{ .uart = .usart1, .signal = .tx, .port = .b, .pin = 6, .af = 7 },
     .{ .uart = .usart1, .signal = .rx, .port = .a, .pin = 10, .af = 7 },
     .{ .uart = .usart1, .signal = .rx, .port = .b, .pin = 7, .af = 7 },
-    // USART2 (AF7)
     .{ .uart = .usart2, .signal = .tx, .port = .a, .pin = 2, .af = 7 },
-    .{ .uart = .usart2, .signal = .tx, .port = .d, .pin = 5, .af = 7 },
     .{ .uart = .usart2, .signal = .rx, .port = .a, .pin = 3, .af = 7 },
-    .{ .uart = .usart2, .signal = .rx, .port = .d, .pin = 6, .af = 7 },
-    // USART3 (AF7)
+    .{ .uart = .usart2, .signal = .rx, .port = .a, .pin = 15, .af = 3 },
+    .{ .uart = .usart3, .signal = .tx, .port = .a, .pin = 5, .af = 7 },
+    .{ .uart = .usart3, .signal = .tx, .port = .b, .pin = 8, .af = 7 },
     .{ .uart = .usart3, .signal = .tx, .port = .b, .pin = 10, .af = 7 },
+    .{ .uart = .usart3, .signal = .tx, .port = .c, .pin = 4, .af = 7 },
     .{ .uart = .usart3, .signal = .tx, .port = .c, .pin = 10, .af = 7 },
-    .{ .uart = .usart3, .signal = .tx, .port = .d, .pin = 8, .af = 7 },
+    .{ .uart = .usart3, .signal = .rx, .port = .a, .pin = 7, .af = 7 },
+    .{ .uart = .usart3, .signal = .rx, .port = .b, .pin = 9, .af = 7 },
     .{ .uart = .usart3, .signal = .rx, .port = .b, .pin = 11, .af = 7 },
+    .{ .uart = .usart3, .signal = .rx, .port = .c, .pin = 5, .af = 7 },
     .{ .uart = .usart3, .signal = .rx, .port = .c, .pin = 11, .af = 7 },
-    .{ .uart = .usart3, .signal = .rx, .port = .d, .pin = 9, .af = 7 },
-    // UART4 (AF8)
-    .{ .uart = .uart4, .signal = .tx, .port = .a, .pin = 0, .af = 8 },
-    .{ .uart = .uart4, .signal = .tx, .port = .c, .pin = 10, .af = 8 },
-    .{ .uart = .uart4, .signal = .rx, .port = .a, .pin = 1, .af = 8 },
-    .{ .uart = .uart4, .signal = .rx, .port = .c, .pin = 11, .af = 8 },
-    // UART5 (AF8)
-    .{ .uart = .uart5, .signal = .tx, .port = .c, .pin = 12, .af = 8 },
-    .{ .uart = .uart5, .signal = .rx, .port = .d, .pin = 2, .af = 8 },
-    // USART6 (AF8)
-    .{ .uart = .usart6, .signal = .tx, .port = .c, .pin = 6, .af = 8 },
-    .{ .uart = .usart6, .signal = .tx, .port = .a, .pin = 11, .af = 8 },
-    .{ .uart = .usart6, .signal = .rx, .port = .c, .pin = 7, .af = 8 },
-    .{ .uart = .usart6, .signal = .rx, .port = .a, .pin = 12, .af = 8 },
+    .{ .uart = .usart4, .signal = .tx, .port = .a, .pin = 0, .af = 8 },
+    .{ .uart = .usart4, .signal = .tx, .port = .c, .pin = 10, .af = 8 },
+    .{ .uart = .usart4, .signal = .rx, .port = .a, .pin = 1, .af = 8 },
+    .{ .uart = .usart4, .signal = .rx, .port = .c, .pin = 11, .af = 8 },
 };
 
 var pb: [64]u8 = undefined;
@@ -63,30 +53,42 @@ fn afFor(comptime uart: Uart, comptime signal: Signal, comptime pin: gpio.Pin) u
 
 fn baseAddr(uart: Uart) u32 {
     return switch (uart) {
-        .usart1 => 0x4001_1000,
+        .usart1 => 0x4001_3800,
         .usart2 => 0x4000_4400,
         .usart3 => 0x4000_4800,
-        .uart4 => 0x4000_4C00,
-        .uart5 => 0x4000_5000,
-        .usart6 => 0x4001_1400,
+        .usart4 => 0x4000_4C00,
     };
 }
 
 fn enableClock(uart: Uart) void {
     switch (uart) {
-        .usart1 => rcc.apb2enr.* |= 1 << 4,
-        .usart6 => rcc.apb2enr.* |= 1 << 5,
-        .usart2 => rcc.apb1enr.* |= 1 << 17,
-        .usart3 => rcc.apb1enr.* |= 1 << 18,
-        .uart4 => rcc.apb1enr.* |= 1 << 19,
-        .uart5 => rcc.apb1enr.* |= 1 << 20,
+        .usart1 => rcc.apbenr2.* |= 1 << 14,
+        .usart2 => rcc.apbenr1.* |= 1 << 17,
+        .usart3 => rcc.apbenr1.* |= 1 << 18,
+        .usart4 => rcc.apbenr1.* |= 1 << 19,
     }
 }
 
-const sr = 0x00;
-const dr = 0x04;
-const brr = 0x08;
-const cr1 = 0x0C;
+const cr1 = 0x00;
+const brr = 0x0C;
+const isr = 0x1C;
+const icr = 0x20;
+const rdr = 0x24;
+const tdr = 0x28;
+
+const CR1_UE: u32 = 1 << 0;
+const CR1_RE: u32 = 1 << 2;
+const CR1_TE: u32 = 1 << 3;
+const CR1_RXNEIE: u32 = 1 << 5;
+
+const ISR_PE: u32 = 1 << 0;
+const ISR_FE: u32 = 1 << 1;
+const ISR_NE: u32 = 1 << 2;
+const ISR_ORE: u32 = 1 << 3;
+const ISR_RXNE: u32 = 1 << 5;
+const ISR_TC: u32 = 1 << 6;
+const ISR_TXE: u32 = 1 << 7;
+const ISR_ERRORS: u32 = ISR_PE | ISR_FE | ISR_NE | ISR_ORE;
 
 fn reg(uart: Uart, offset: u32) *volatile u32 {
     return @ptrFromInt(baseAddr(uart) + offset);
@@ -109,27 +111,37 @@ pub fn init(comptime uart: Uart, comptime config: Config) void {
         @compileError("uart.init needs at least one of .tx / .rx");
 
     enableClock(uart);
+    attachPins(uart, config);
 
-    var cr1_bits: u32 = 0x2000;
+    var cr1_bits: u32 = CR1_UE;
+    if (config.tx != null) cr1_bits |= CR1_TE;
+    if (config.rx != null) cr1_bits |= CR1_RE;
+
+    reg(uart, cr1).* = 0;
+    reg(uart, brr).* = computeBRR(config.baud);
+    reg(uart, cr1).* = cr1_bits;
+}
+
+pub fn attachPins(comptime uart: Uart, comptime config: Config) void {
     if (config.tx) |tx| {
         gpio.enable(tx.port);
         gpio.alternate(tx.port, tx.num, comptime afFor(uart, .tx, tx));
-        cr1_bits |= 0x0008;
     }
     if (config.rx) |rx| {
         gpio.enable(rx.port);
         gpio.alternate(rx.port, rx.num, comptime afFor(uart, .rx, rx));
         gpio.pullUp(rx.port, rx.num);
-        cr1_bits |= 0x0004;
     }
+}
 
-    reg(uart, brr).* = computeBRR(config.baud);
-    reg(uart, cr1).* = cr1_bits;
+pub fn detachPins(comptime config: Config) void {
+    if (config.tx) |tx| gpio.analog(tx);
+    if (config.rx) |rx| gpio.analog(rx);
 }
 
 pub fn writeByte(uart: Uart, byte: u8) void {
-    while ((reg(uart, sr).* & 0x0080) == 0) {}
-    reg(uart, dr).* = byte;
+    while ((reg(uart, isr).* & ISR_TXE) == 0) {}
+    reg(uart, tdr).* = byte;
 }
 
 pub fn readByte(uart: Uart) u8 {
@@ -143,39 +155,11 @@ pub fn tryReadByte(uart: Uart) ?u8 {
         if (@atomicLoad(bool, &ring.enabled, .acquire)) return ring.pop();
     }
 
-    if ((reg(uart, sr).* & 0x0020) == 0) return null;
-    return @truncate(reg(uart, dr).*);
+    const status = reg(uart, isr).*;
+    if (status & ISR_ERRORS != 0) reg(uart, icr).* = ISR_ERRORS;
+    if ((status & ISR_RXNE) == 0) return null;
+    return @truncate(reg(uart, rdr).*);
 }
-
-const RX_RING_SIZE: u32 = 512;
-
-const RxRing = struct {
-    buf: [RX_RING_SIZE]u8 = undefined,
-    head: u32 = 0,
-    tail: u32 = 0,
-    enabled: bool = false,
-    dropped: u32 = 0,
-
-    fn push(ring: *RxRing, byte: u8) void {
-        const head = @atomicLoad(u32, &ring.head, .monotonic);
-        const tail = @atomicLoad(u32, &ring.tail, .acquire);
-        if (head -% tail >= RX_RING_SIZE) {
-            ring.dropped +%= 1;
-            return;
-        }
-        ring.buf[head % RX_RING_SIZE] = byte;
-        @atomicStore(u32, &ring.head, head +% 1, .release);
-    }
-
-    fn pop(ring: *RxRing) ?u8 {
-        const tail = @atomicLoad(u32, &ring.tail, .monotonic);
-        const head = @atomicLoad(u32, &ring.head, .acquire);
-        if (head == tail) return null;
-        const byte = ring.buf[tail % RX_RING_SIZE];
-        @atomicStore(u32, &ring.tail, tail +% 1, .release);
-        return byte;
-    }
-};
 
 const irq_uarts = [_]Uart{.usart1};
 
@@ -188,16 +172,14 @@ fn ringFor(uart: Uart) ?*RxRing {
     return null;
 }
 
-const NVIC_ISER: [*]volatile u32 = @ptrFromInt(0xE000_E100);
+const NVIC_ISER0: *volatile u32 = @ptrFromInt(0xE000_E100);
 
-fn irqNumber(uart: Uart) u32 {
+fn irqNumber(uart: Uart) u5 {
     return switch (uart) {
-        .usart1 => 37,
-        .usart2 => 38,
-        .usart3 => 39,
-        .uart4 => 52,
-        .uart5 => 53,
-        .usart6 => 71,
+        .usart1 => 27,
+        .usart2 => 28,
+        .usart3 => 29,
+        .usart4 => 30,
     };
 }
 
@@ -208,13 +190,13 @@ pub fn enableRxInterrupt(comptime uart: Uart) void {
         }
         @compileError(@tagName(uart) ++ " has no RX ring/IRQ handler -- add it to irq_uarts");
     };
-    while ((reg(uart, sr).* & 0x0020) != 0) _ = reg(uart, dr).*;
+    reg(uart, icr).* = ISR_ERRORS;
+    while ((reg(uart, isr).* & ISR_RXNE) != 0) _ = reg(uart, rdr).*;
     @atomicStore(bool, &ring.enabled, true, .release);
 
-    reg(uart, cr1).* |= 0x0020;
+    reg(uart, cr1).* |= CR1_RXNEIE;
 
-    const irq = irqNumber(uart);
-    NVIC_ISER[irq / 32] = @as(u32, 1) << @intCast(irq % 32);
+    NVIC_ISER0.* = @as(u32, 1) << irqNumber(uart);
 }
 
 pub fn droppedBytes(uart: Uart) u32 {
@@ -223,11 +205,9 @@ pub fn droppedBytes(uart: Uart) u32 {
 }
 
 fn handleRx(comptime uart: Uart) void {
-    const status = reg(uart, sr).*;
-    if ((status & 0x002F) != 0) {
-        const byte: u8 = @truncate(reg(uart, dr).*);
-        if ((status & 0x0020) != 0) ringFor(uart).?.push(byte);
-    }
+    const status = reg(uart, isr).*;
+    if (status & ISR_ERRORS != 0) reg(uart, icr).* = ISR_ERRORS;
+    if (status & ISR_RXNE != 0) ringFor(uart).?.push(@truncate(reg(uart, rdr).*));
 }
 
 export fn USART1_IRQHandler() void {
@@ -235,7 +215,7 @@ export fn USART1_IRQHandler() void {
 }
 
 pub fn flush(uart: Uart) void {
-    while ((reg(uart, sr).* & 0x0040) == 0) {}
+    while ((reg(uart, isr).* & ISR_TC) == 0) {}
 }
 
 pub fn writeStr(uart: Uart, str: []const u8) void {

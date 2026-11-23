@@ -1,6 +1,6 @@
 //! SysTick-based millisecond timer
 
-const rtc = @import("rtc.zig");
+const rtc = @import("../../hal.zig").rtc;
 
 const SYSTICK_BASE = 0xE000_E010;
 const STK_CTRL = @as(*volatile u32, @ptrFromInt(SYSTICK_BASE + 0x00));

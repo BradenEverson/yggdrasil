@@ -1,11 +1,18 @@
 //! Hardware Abstraction Layer of Fun and Happiness!!!
 
-pub const gpio = @import("hal/gpio.zig");
-pub const uart = @import("hal/uart.zig");
-pub const i2c = @import("hal/i2c.zig");
-pub const timer = @import("hal/timer.zig");
-pub const rtc = @import("hal/rtc.zig");
-pub const lowpower = @import("hal/lowpower.zig");
+const target = @import("target");
+
+const chip = switch (target.chip) {
+    .f446 => @import("hal/f4.zig"),
+    .u073 => @import("hal/u0.zig"),
+};
+
+pub const gpio = chip.gpio;
+pub const uart = chip.uart;
+pub const i2c = chip.i2c;
+pub const rtc = chip.rtc;
+pub const lowpower = chip.lowpower;
+pub const timer = @import("hal/common/timer.zig");
 
 fn copyForward(dest: [*]volatile u8, src: [*]const u8, n: usize) void {
     var i: usize = 0;
@@ -89,4 +96,27 @@ pub fn reset() noreturn {
     asm volatile ("dsb");
     SCB_AIRCR.* = 0x05FA_0004;
     while (true) {}
+}
+
+extern const _sidata: u8;
+extern var _sdata: u8;
+extern var _edata: u8;
+extern var _sbss: u8;
+extern var _ebss: u8;
+
+fn initMemory() void {
+    const data: [*]volatile u8 = @ptrCast(&_sdata);
+    const load: [*]const u8 = @ptrCast(&_sidata);
+    const data_len = @intFromPtr(&_edata) - @intFromPtr(&_sdata);
+    for (0..data_len) |i| data[i] = load[i];
+
+    const bss: [*]volatile u8 = @ptrCast(&_sbss);
+    const bss_len = @intFromPtr(&_ebss) - @intFromPtr(&_sbss);
+    for (0..bss_len) |i| bss[i] = 0;
+}
+
+export fn run() void {
+    initMemory();
+    chip.initCpu();
+    @call(.never_inline, @import("root").app, .{});
 }

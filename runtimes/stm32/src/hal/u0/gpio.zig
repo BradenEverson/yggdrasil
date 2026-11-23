@@ -1,8 +1,6 @@
-//! GPIO control!!!!
-
 const rcc = @import("rcc.zig");
 
-pub const Port = enum(u3) { a, b, c, d, e, f, g, h };
+pub const Port = enum(u3) { a, b, c, d, e, f };
 
 pub const Pin = struct {
     port: Port,
@@ -19,7 +17,7 @@ const afrl = 0x20;
 const afrh = 0x24;
 
 fn reg(port: Port, offset: u32) *volatile u32 {
-    const addr: u32 = 0x4002_0000 + @as(u32, @intFromEnum(port)) * 0x400 + offset;
+    const addr: u32 = 0x5000_0000 + @as(u32, @intFromEnum(port)) * 0x400 + offset;
     return @ptrFromInt(addr);
 }
 
@@ -30,11 +28,11 @@ fn setMode(port: Port, pin: u4, mode: Mode) void {
 }
 
 pub fn enable(port: Port) void {
-    rcc.ahb1enr.* |= @as(u32, 1) << @intFromEnum(port);
+    rcc.iopenr.* |= @as(u32, 1) << @intFromEnum(port);
 }
 
 pub fn disable(port: Port) void {
-    rcc.ahb1enr.* &= ~(@as(u32, 1) << @intFromEnum(port));
+    rcc.iopenr.* &= ~(@as(u32, 1) << @intFromEnum(port));
 }
 
 pub fn analogMask(port: Port, mask: u16) void {
@@ -47,6 +45,10 @@ pub fn analogMask(port: Port, mask: u16) void {
     }
     reg(port, pupdr).* &= ~pull_bits;
     reg(port, moder).* |= moder_bits;
+}
+
+pub fn analog(pin: Pin) void {
+    analogMask(pin.port, @as(u16, 1) << pin.num);
 }
 
 pub fn output(port: Port, pin: u4) void {

@@ -1,5 +1,5 @@
 const rtc = @import("rtc.zig");
-const timer = @import("timer.zig");
+const timer = @import("../common/timer.zig");
 const gpio = @import("gpio.zig");
 
 const SCB_SCR: *volatile u32 = @ptrFromInt(0xE000_ED10);

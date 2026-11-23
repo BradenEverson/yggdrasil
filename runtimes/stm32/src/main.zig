@@ -1,13 +1,24 @@
 const std = @import("std");
 const yggdrasil = @import("yggdrasil");
 const node_config = @import("node_config");
+const target = @import("target");
 
 const hal = @import("hal.zig");
 const Rylr = @import("drivers/rylr896.zig");
 const bme688 = @import("drivers/bme688.zig");
 
-const debug: hal.uart.Uart = .usart2;
-const lora_uart: hal.uart.Uart = .usart1;
+comptime {
+    _ = hal;
+}
+
+const board = switch (target.chip) {
+    .f446 => @import("board/nucleo_f446re.zig"),
+    .u073 => @import("board/u073rc.zig"),
+};
+
+const debug = board.debug_uart;
+const lora_uart = board.lora_uart;
+const sensor_i2c = board.sensor_i2c;
 const BAUD_RATE = 115200;
 const LORA_TX_SIZE = 256;
 const LORA_LINE_SIZE = 32;
@@ -48,17 +59,32 @@ comptime {
         @compileError("sample_ms must be a nonzero multiple of 10000, at most 2550000");
 }
 
+const debug_config: hal.uart.Config = .{
+    .baud = BAUD_RATE,
+    .tx = board.debug_tx,
+    .rx = board.debug_rx,
+};
+
+const lora_config: hal.uart.Config = .{
+    .baud = BAUD_RATE,
+    .tx = board.lora_tx,
+    .rx = board.lora_rx,
+};
+
+const sensor_config: hal.i2c.Config = .{
+    .scl = board.sensor_scl,
+    .sda = board.sensor_sda,
+    .speed = .standard,
+};
+
 const used_pins = [_]hal.gpio.Pin{
-    .{ .port = .a, .num = 2 },
-    .{ .port = .a, .num = 3 },
-    .{ .port = .a, .num = 9 },
-    .{ .port = .a, .num = 10 },
-    .{ .port = .b, .num = 8 },
-    .{ .port = .b, .num = 9 },
-} ++ if (node_config.swd) [_]hal.gpio.Pin{
-    .{ .port = .a, .num = 13 },
-    .{ .port = .a, .num = 14 },
-} else [_]hal.gpio.Pin{};
+    board.debug_tx,
+    board.debug_rx,
+    board.lora_tx,
+    board.lora_rx,
+    board.sensor_scl,
+    board.sensor_sda,
+} ++ if (node_config.swd) board.swd_pins else [_]hal.gpio.Pin{};
 
 var lora_rx: [LORA_LINE_SIZE]u8 = undefined;
 var lora_tx: [LORA_TX_SIZE]u8 = undefined;
@@ -128,49 +154,17 @@ fn fail(what: []const u8, err: anyerror) noreturn {
     hal.reset();
 }
 
-const CPACR: *volatile u32 = @ptrFromInt(0xE000_ED88);
-
-extern const _sidata: u8;
-extern var _sdata: u8;
-extern var _edata: u8;
-extern var _sbss: u8;
-extern var _ebss: u8;
-
-fn initMemory() void {
-    const data: [*]volatile u8 = @ptrCast(&_sdata);
-    const load: [*]const u8 = @ptrCast(&_sidata);
-    const data_len = @intFromPtr(&_edata) - @intFromPtr(&_sdata);
-    for (0..data_len) |i| data[i] = load[i];
-
-    const bss: [*]volatile u8 = @ptrCast(&_sbss);
-    const bss_len = @intFromPtr(&_ebss) - @intFromPtr(&_sbss);
-    for (0..bss_len) |i| bss[i] = 0;
-}
-
-export fn run() void {
-    initMemory();
-    CPACR.* |= 0xF << 20;
-    asm volatile ("dsb\n isb");
-    @call(.never_inline, app, .{});
-}
-
 fn quiesce() void {
     if (node_config.log) hal.uart.flush(debug);
     hal.uart.flush(lora_uart);
 }
 
-const USART_AF: u4 = 7;
-const I2C_AF: u4 = 4;
-
 fn stopFor(ms: u32) void {
-    hal.gpio.analogMask(.a, (1 << 9) | (1 << 10));
-    hal.gpio.analogMask(.b, (1 << 8) | (1 << 9));
+    hal.uart.detachPins(lora_config);
+    hal.i2c.detachPins(sensor_config);
     hal.lowpower.stopFor(ms);
-    hal.gpio.alternate(.b, 8, I2C_AF);
-    hal.gpio.alternate(.b, 9, I2C_AF);
-    hal.gpio.alternate(.a, 9, USART_AF);
-    hal.gpio.alternate(.a, 10, USART_AF);
-    hal.gpio.pullUp(.a, 10);
+    hal.i2c.attachPins(sensor_i2c, sensor_config);
+    hal.uart.attachPins(lora_uart, lora_config);
 }
 
 fn sleepRadio() void {
@@ -246,28 +240,18 @@ fn configureRadio() Rylr.RylrError!void {
     try lora.setPower(node_config.tx_power);
 }
 
-fn app() void {
+pub fn app() void {
     hal.lowpower.parkUnusedPins(&used_pins);
 
-    if (node_config.log) {
-        hal.uart.init(debug, .{
-            .baud = BAUD_RATE,
-            .tx = .{ .port = .a, .num = 2 },
-            .rx = .{ .port = .a, .num = 3 },
-        });
-    }
+    if (node_config.log) hal.uart.init(debug, debug_config);
 
-    hal.timer.init(16_000_000);
+    hal.timer.init(board.sysclk_hz);
     const clock_source = hal.rtc.init();
     log("rtc on {s}\r\n", .{@tagName(clock_source)});
 
-    hal.i2c.init(.i2c1, .{
-        .scl = .{ .port = .b, .num = 8 },
-        .sda = .{ .port = .b, .num = 9 },
-        .speed = .standard,
-    });
+    hal.i2c.init(sensor_i2c, sensor_config);
 
-    sensor = bme688.Bme688.init(.i2c1, bme688.ADDR_HIGH, bme688.LOW_POWER) catch |e| fail("BME688 init", e);
+    sensor = bme688.Bme688.init(sensor_i2c, bme688.ADDR_HIGH, bme688.LOW_POWER) catch |e| fail("BME688 init", e);
 
     lora = .{
         .uart = lora_uart,
@@ -275,11 +259,7 @@ fn app() void {
         .tx_buffer = &lora_tx,
     };
 
-    hal.uart.init(lora_uart, .{
-        .baud = BAUD_RATE,
-        .tx = .{ .port = .a, .num = 9 },
-        .rx = .{ .port = .a, .num = 10 },
-    });
+    hal.uart.init(lora_uart, lora_config);
 
     lora.reset();
     hal.timer.delayMs(1000);
