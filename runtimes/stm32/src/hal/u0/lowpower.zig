@@ -39,11 +39,13 @@ pub fn stopFor(ms: u32) void {
     stopUntil(rtc.millis() +% ms);
 }
 
+const reserved_f: u16 = 1 << 2;
+
 pub fn parkUnusedPins(comptime keep: []const gpio.Pin) void {
     const ports = [_]gpio.Port{ .a, .b, .c, .d, .f };
     inline for (ports) |port| {
         gpio.enable(port);
-        var mask: u16 = 0xFFFF;
+        var mask: u16 = if (port == .f) ~reserved_f else 0xFFFF;
         inline for (keep) |pin| {
             if (pin.port == port) mask &= ~(@as(u16, 1) << pin.num);
         }
