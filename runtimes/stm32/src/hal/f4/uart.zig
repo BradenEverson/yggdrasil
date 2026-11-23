@@ -109,22 +109,31 @@ pub fn init(comptime uart: Uart, comptime config: Config) void {
         @compileError("uart.init needs at least one of .tx / .rx");
 
     enableClock(uart);
+    attachPins(uart, config);
 
     var cr1_bits: u32 = 0x2000;
+    if (config.tx != null) cr1_bits |= 0x0008;
+    if (config.rx != null) cr1_bits |= 0x0004;
+
+    reg(uart, brr).* = computeBRR(config.baud);
+    reg(uart, cr1).* = cr1_bits;
+}
+
+pub fn attachPins(comptime uart: Uart, comptime config: Config) void {
     if (config.tx) |tx| {
         gpio.enable(tx.port);
         gpio.alternate(tx.port, tx.num, comptime afFor(uart, .tx, tx));
-        cr1_bits |= 0x0008;
     }
     if (config.rx) |rx| {
         gpio.enable(rx.port);
         gpio.alternate(rx.port, rx.num, comptime afFor(uart, .rx, rx));
         gpio.pullUp(rx.port, rx.num);
-        cr1_bits |= 0x0004;
     }
+}
 
-    reg(uart, brr).* = computeBRR(config.baud);
-    reg(uart, cr1).* = cr1_bits;
+pub fn detachPins(comptime config: Config) void {
+    if (config.tx) |tx| gpio.analog(tx);
+    if (config.rx) |rx| gpio.analog(rx);
 }
 
 pub fn writeByte(uart: Uart, byte: u8) void {

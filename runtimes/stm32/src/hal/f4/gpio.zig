@@ -49,6 +49,10 @@ pub fn analogMask(port: Port, mask: u16) void {
     reg(port, moder).* |= moder_bits;
 }
 
+pub fn analog(pin: Pin) void {
+    analogMask(pin.port, @as(u16, 1) << pin.num);
+}
+
 pub fn output(port: Port, pin: u4) void {
     setMode(port, pin, .output);
 }

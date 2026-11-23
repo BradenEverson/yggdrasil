@@ -94,7 +94,16 @@ pub const Config = struct {
 
 pub fn init(comptime i2c: I2c, comptime config: Config) void {
     rcc.apb1enr.* |= @as(u32, 1) << (21 + @as(u5, @intFromEnum(i2c)));
+    attachPins(i2c, config);
 
+    reg(i2c, cr1).* = 0;
+    reg(i2c, cr2).* = pclk1 / 1_000_000;
+    reg(i2c, ccr).* = ccrValue(config.speed);
+    reg(i2c, trise).* = triseValue(config.speed);
+    reg(i2c, cr1).* = CR1_PE;
+}
+
+pub fn attachPins(comptime i2c: I2c, comptime config: Config) void {
     inline for (.{
         .{ config.scl, Signal.scl },
         .{ config.sda, Signal.sda },
@@ -105,12 +114,11 @@ pub fn init(comptime i2c: I2c, comptime config: Config) void {
         if (config.internal_pullups) gpio.pullUp(pin.port, pin.num);
         gpio.alternate(pin.port, pin.num, comptime afFor(i2c, line[1], pin));
     }
+}
 
-    reg(i2c, cr1).* = 0;
-    reg(i2c, cr2).* = pclk1 / 1_000_000;
-    reg(i2c, ccr).* = ccrValue(config.speed);
-    reg(i2c, trise).* = triseValue(config.speed);
-    reg(i2c, cr1).* = CR1_PE;
+pub fn detachPins(comptime config: Config) void {
+    gpio.analog(config.scl);
+    gpio.analog(config.sda);
 }
 
 pub fn write(i2c: I2c, addr: u7, data: []const u8) Error!void {

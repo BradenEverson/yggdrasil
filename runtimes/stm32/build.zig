@@ -1,13 +1,28 @@
 const std = @import("std");
 
+const Chip = enum { f446 };
+
+fn targetQuery(chip: Chip) std.Target.Query {
+    return switch (chip) {
+        .f446 => .{
+            .cpu_arch = .thumb,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m4 },
+            .cpu_features_add = std.Target.arm.featureSet(&.{.vfp4d16sp}),
+            .os_tag = .freestanding,
+            .abi = .eabihf,
+        },
+    };
+}
+
+fn linkerScript(chip: Chip) []const u8 {
+    return switch (chip) {
+        .f446 => "ld/f446.ld",
+    };
+}
+
 pub fn build(b: *std.Build) void {
-    const target = b.resolveTargetQuery(.{
-        .cpu_arch = .thumb,
-        .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m4 },
-        .cpu_features_add = std.Target.arm.featureSet(&.{.vfp4d16sp}),
-        .os_tag = .freestanding,
-        .abi = .eabihf,
-    });
+    const chip = b.option(Chip, "chip", "Target MCU") orelse .f446;
+    const target = b.resolveTargetQuery(targetQuery(chip));
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall });
 
     const obj = b.addObject(.{
@@ -43,13 +58,19 @@ pub fn build(b: *std.Build) void {
     node_config.addOption(u4, "tx_power", b.option(u4, "tx_power", "RF output power in dBm 0-15") orelse 15);
     node_config.addOption(u8, "beacon_periods", b.option(u8, "beacon_periods", "Periods between root beacons from joined nodes, also sets the join scan length, must match the whole network") orelse 1);
     node_config.addOption(u32, "radio_wake_ms", b.option(u32, "radio_wake_ms", "Lead time to wake the radio before a window") orelse 200);
-    node_config.addOption(bool, "log", b.option(bool, "log", "Print debug output on USART2") orelse true);
+    node_config.addOption(bool, "log", b.option(bool, "log", "Print debug output on the board debug UART") orelse true);
     node_config.addOption(bool, "radio_sleep", b.option(bool, "radio_sleep", "Put the radio and MCU to sleep between windows") orelse true);
     node_config.addOption(bool, "trace", b.option(bool, "trace", "Log every frame sent and received") orelse false);
     node_config.addOption(bool, "swd", b.option(bool, "swd", "Keep the SWD pins active") orelse true);
     obj.root_module.addOptions("node_config", node_config);
 
-    const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "--gc-sections", "-T", "flash.ld", "-o" });
+    const target_config = b.addOptions();
+    target_config.addOption(Chip, "chip", chip);
+    obj.root_module.addOptions("target", target_config);
+
+    const ld_cmd = b.addSystemCommand(&.{ "arm-none-eabi-ld", "--gc-sections", "-T" });
+    ld_cmd.addFileArg(b.path(linkerScript(chip)));
+    ld_cmd.addArg("-o");
     const elf_file = ld_cmd.addOutputFileArg("yggdrasil.elf");
     ld_cmd.addArtifactArg(obj);
 
