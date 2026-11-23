@@ -4,6 +4,7 @@ const target = @import("target");
 
 const chip = switch (target.chip) {
     .f446 => @import("hal/f4.zig"),
+    .u073 => @import("hal/u0.zig"),
 };
 
 pub const gpio = chip.gpio;

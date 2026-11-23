@@ -3,6 +3,7 @@
 const std = @import("std");
 const gpio = @import("gpio.zig");
 const rcc = @import("rcc.zig");
+const RxRing = @import("../common/rx_ring.zig").RxRing;
 
 pub const Uart = enum { usart1, usart2, usart3, uart4, uart5, usart6 };
 
@@ -155,36 +156,6 @@ pub fn tryReadByte(uart: Uart) ?u8 {
     if ((reg(uart, sr).* & 0x0020) == 0) return null;
     return @truncate(reg(uart, dr).*);
 }
-
-const RX_RING_SIZE: u32 = 512;
-
-const RxRing = struct {
-    buf: [RX_RING_SIZE]u8 = undefined,
-    head: u32 = 0,
-    tail: u32 = 0,
-    enabled: bool = false,
-    dropped: u32 = 0,
-
-    fn push(ring: *RxRing, byte: u8) void {
-        const head = @atomicLoad(u32, &ring.head, .monotonic);
-        const tail = @atomicLoad(u32, &ring.tail, .acquire);
-        if (head -% tail >= RX_RING_SIZE) {
-            ring.dropped +%= 1;
-            return;
-        }
-        ring.buf[head % RX_RING_SIZE] = byte;
-        @atomicStore(u32, &ring.head, head +% 1, .release);
-    }
-
-    fn pop(ring: *RxRing) ?u8 {
-        const tail = @atomicLoad(u32, &ring.tail, .monotonic);
-        const head = @atomicLoad(u32, &ring.head, .acquire);
-        if (head == tail) return null;
-        const byte = ring.buf[tail % RX_RING_SIZE];
-        @atomicStore(u32, &ring.tail, tail +% 1, .release);
-        return byte;
-    }
-};
 
 const irq_uarts = [_]Uart{.usart1};
 

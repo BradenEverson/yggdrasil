@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Chip = enum { f446 };
+const Chip = enum { f446, u073 };
 
 fn targetQuery(chip: Chip) std.Target.Query {
     return switch (chip) {
@@ -11,12 +11,26 @@ fn targetQuery(chip: Chip) std.Target.Query {
             .os_tag = .freestanding,
             .abi = .eabihf,
         },
+        .u073 => .{
+            .cpu_arch = .thumb,
+            .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m0plus },
+            .os_tag = .freestanding,
+            .abi = .eabi,
+        },
     };
 }
 
 fn linkerScript(chip: Chip) []const u8 {
     return switch (chip) {
         .f446 => "ld/f446.ld",
+        .u073 => "ld/u073.ld",
+    };
+}
+
+fn defaultQueueLength(chip: Chip) usize {
+    return switch (chip) {
+        .f446 => 8,
+        .u073 => 4,
     };
 }
 
@@ -41,8 +55,8 @@ pub fn build(b: *std.Build) void {
     const yggdrasil = b.dependency("yggdrasil", .{
         .target = target,
         .optimize = optimize,
-        .max_neighbors = @as(usize, 16),
-        .max_queue_length = @as(usize, 8),
+        .max_neighbors = b.option(usize, "max_neighbors", "Neighbor slots in the yggdrasil message queue") orelse 16,
+        .max_queue_length = b.option(usize, "max_queue_length", "Queued packets per neighbor") orelse defaultQueueLength(chip),
     });
 
     obj.root_module.addImport("yggdrasil", yggdrasil.module("yggdrasil"));

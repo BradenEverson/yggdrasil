@@ -13,6 +13,7 @@ comptime {
 
 const board = switch (target.chip) {
     .f446 => @import("board/nucleo_f446re.zig"),
+    .u073 => @import("board/u073rc.zig"),
 };
 
 const debug = board.debug_uart;
