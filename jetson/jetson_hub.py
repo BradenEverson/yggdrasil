@@ -374,7 +374,7 @@ class Hub(object):
 def main():
     parser = argparse.ArgumentParser(description="Yggdrasil hub for the Jetson Nano")
     parser.add_argument("--address", type=int, default=100, help="Yggdrasil/LoRa address of the hub")
-    parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:8765/readings) to stream batched binary readings to (see hub_stream.py); CSV logging is used if omitted")
+    parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:6767/hub) to stream batched binary readings to (see hub_stream.py); CSV logging is used if omitted")
     parser.add_argument("--batch-seconds", type=float, default=BATCH_PERIOD_S, help="How long readings are held before being streamed together in one frame")
     parser.add_argument("--csv", default="log.csv", help="CSV file to append readings to when --ws is not given")
     parser.add_argument("--port", default="/dev/ttyTHS1", help="RYLR896 serial port")
