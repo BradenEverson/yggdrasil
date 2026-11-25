@@ -1,13 +1,14 @@
 import argparse
 import csv
+import math
 import os
 import random
 import select
-import struct
 import time
 import websocket
-from datetime import datetime, timedelta
+from datetime import datetime
 
+import hub_stream
 import yggdrasil
 from rylr896 import RYLR896
 
@@ -19,6 +20,9 @@ LOOP_SLEEP_S = 0.005
 RADIO_CHECK_PERIOD_S = 60.0
 WS_CONNECT_TIMEOUT_S = 3.0
 WS_RECONNECT_PERIOD_S = 10.0
+BATCH_PERIOD_S = 60.0
+MAX_FRAME_BYTES = 4096
+MAX_PENDING_RECORDS = 20_000
 ROOT_BEACON_MS = 20_000
 MAX_CHILDREN = 0
 
@@ -78,11 +82,15 @@ class CsvLog(object):
 
 
 class WebSocketStream(object):
-    def __init__(self, url):
+    def __init__(self, url, batch_s=BATCH_PERIOD_S):
         self._websocket = websocket
         self.url = url
         self.ws = None
         self.next_attempt = 0.0
+        self.batch_s = batch_s
+        self.pending = []
+        self.next_flush = None
+        self.dropped = 0
         self.connect()
 
     def connect(self):
@@ -110,29 +118,59 @@ class WebSocketStream(object):
 
     def send(self, payload):
         if self.ws is None and not self.connect():
-            print("Websocket unavailable, dropping reading")
             return False
         try:
             self.ws.send_binary(payload)
             return True
         except Exception as e:
             self.drop(e)
-            print("Dropped reading")
             return False
 
+    def queue(self, record):
+        self.pending.append(hub_stream.encode_record(record))
+        if len(self.pending) > MAX_PENDING_RECORDS:
+            overflow = len(self.pending) - MAX_PENDING_RECORDS
+            del self.pending[:overflow]
+            self.dropped += overflow
+            print(f"Stream backlog full, dropped {self.dropped} oldest readings so far")
+        if self.next_flush is None:
+            self.next_flush = time.monotonic() + self.batch_s
+
+    def flush(self):
+        while self.pending:
+            size, count = 1, 0
+            for encoded in self.pending:
+                if count and size + len(encoded) > MAX_FRAME_BYTES:
+                    break
+                size += len(encoded)
+                count += 1
+            if not self.send(hub_stream.encode_frame(self.pending[:count])):
+                print(f"Websocket unavailable, holding {len(self.pending)} readings")
+                self.next_flush = time.monotonic() + self.batch_s
+                return False
+            print(f"Streamed {count} readings ({size} bytes)")
+            del self.pending[:count]
+        self.next_flush = None
+        return True
+
     def poll(self):
-        if self.ws is None:
-            return
-        try:
-            while select.select([self.ws.sock], [], [], 0)[0]:
-                opcode, _ = self.ws.recv_data_frame(control_frame=True)
-                if opcode == self._websocket.ABNF.OPCODE_CLOSE:
-                    self.drop("closed by server")
-                    return
-        except Exception as e:
-            self.drop(e)
+        if self.ws is not None:
+            try:
+                while select.select([self.ws.sock], [], [], 0)[0]:
+                    opcode, _ = self.ws.recv_data_frame(control_frame=True)
+                    if opcode == self._websocket.ABNF.OPCODE_CLOSE:
+                        self.drop("closed by server")
+                        break
+            except Exception as e:
+                self.drop(e)
+
+        if self.next_flush is not None and time.monotonic() >= self.next_flush:
+            self.flush()
 
     def close(self):
+        if self.pending:
+            self.next_attempt = 0.0
+            self.flush()
         if self.ws is not None:
             try:
                 self.ws.close(timeout=0.5)
@@ -225,28 +263,26 @@ class Hub(object):
         op, payload = app
 
         if op == yggdrasil.OP_SENSOR_READINGS and not broadcast:
-            self.on_readings(origin, from_addr, yggdrasil.parse_sensor_readings(payload), bytes(payload))
+            self.on_readings(origin, from_addr, yggdrasil.parse_sensor_readings(payload))
         elif op == yggdrasil.OP_COMPACT_READINGS and not broadcast:
-            readings = yggdrasil.parse_compact_readings(payload)
-            self.on_readings(origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
+            self.on_readings(origin, from_addr, yggdrasil.parse_compact_readings(payload))
         elif op == yggdrasil.OP_BATCHED_READINGS and not broadcast:
             entries = yggdrasil.parse_batched_readings(payload)
             if not entries:
                 print(f"Malformed batch from Node {origin} (via {from_addr})")
             for entry_origin, readings in entries:
-                self.on_readings(entry_origin, from_addr, readings, yggdrasil.encode_sensor_readings(readings))
+                self.on_readings(entry_origin, from_addr, readings)
         elif op == yggdrasil.OP_READING_SERIES and not broadcast:
             records = yggdrasil.parse_reading_series(payload)
             if not records:
                 print(f"Malformed series from Node {origin} (via {from_addr})")
             for entry_origin, samples in records:
                 for age_s, readings in samples:
-                    wire = yggdrasil.encode_sensor_readings(readings + [("age_s", float(age_s))])
-                    self.on_readings(entry_origin, from_addr, readings, wire, age_s)
+                    self.on_readings(entry_origin, from_addr, readings, age_s)
         elif op == yggdrasil.OP_HELLO and broadcast:
             print(f"Hello from {from_addr}")
 
-    def on_readings(self, origin, from_addr, readings, wire, age_s=0):
+    def on_readings(self, origin, from_addr, readings, age_s=0):
         if not readings:
             print(f"Malformed readings from Node {origin} (via {from_addr})")
             return
@@ -254,24 +290,42 @@ class Hub(object):
         age = f", {age_s} s ago" if age_s else ""
         print(f"From Node {origin} (via {from_addr}, rssi {self.last_rssi}{age}): {pretty}")
 
+        record = self.make_record(origin, from_addr, readings, age_s)
         if self.stream is not None:
-            self.stream.send(struct.pack(">H", origin) + wire)
-            return
+            self.stream.queue(record)
+        else:
+            self.log_record(record)
 
-        row = {
-            "timestamp": (datetime.now() - timedelta(seconds=age_s)).isoformat(timespec="seconds"),
-            "node_address": origin,
+    def make_record(self, origin, from_addr, readings, age_s):
+        values = {}
+        for name, value in readings:
+            if isinstance(value, float) and not math.isfinite(value):
+                value = None
+            values[KNOWN_READINGS.get(name, name)] = value
+        return {
+            "node": origin,
             "via": from_addr,
             "rssi": self.last_rssi,
             "snr": self.last_snr,
+            "time": round(time.time()) - age_s,
+            "readings": values,
+        }
+
+    def log_record(self, record):
+        known = set(KNOWN_READINGS.values())
+        row = {
+            "timestamp": datetime.fromtimestamp(record["time"]).isoformat(timespec="seconds"),
+            "node_address": record["node"],
+            "via": record["via"],
+            "rssi": record["rssi"],
+            "snr": record["snr"],
         }
         extra = []
-        for name, value in readings:
+        for name, value in record["readings"].items():
             if isinstance(value, float):
                 value = round(value, 3)
-            column = KNOWN_READINGS.get(name)
-            if column:
-                row[column] = value
+            if name in known:
+                row[name] = value
             else:
                 extra.append(f"{name}={value}")
         row["extra"] = ";".join(extra)
@@ -320,7 +374,8 @@ class Hub(object):
 def main():
     parser = argparse.ArgumentParser(description="Yggdrasil hub for the Jetson Nano")
     parser.add_argument("--address", type=int, default=100, help="Yggdrasil/LoRa address of the hub")
-    parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:8765/readings) to stream raw reading payloads to; CSV logging is used if omitted")
+    parser.add_argument("--ws", default=None, help="Websocket endpoint (e.g. ws://host:8765/readings) to stream batched binary readings to (see hub_stream.py); CSV logging is used if omitted")
+    parser.add_argument("--batch-seconds", type=float, default=BATCH_PERIOD_S, help="How long readings are held before being streamed together in one frame")
     parser.add_argument("--csv", default="log.csv", help="CSV file to append readings to when --ws is not given")
     parser.add_argument("--port", default="/dev/ttyTHS1", help="RYLR896 serial port")
     parser.add_argument("--sf", type=int, default=7, help="LoRa spreading factor (7-12), must match every node")
@@ -337,8 +392,8 @@ def main():
     stream = None
     log = None
     if args.ws is not None:
-        stream = WebSocketStream(args.ws)
-        print(f"Streaming readings to {args.ws}")
+        stream = WebSocketStream(args.ws, args.batch_seconds)
+        print(f"Streaming readings to {args.ws} every {args.batch_seconds:g} s")
     else:
         log = CsvLog(args.csv)
         print(f"Logging to {os.path.abspath(args.csv)}")
