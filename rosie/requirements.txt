@@ -1,0 +1,8 @@
+websocket-client
+numpy
+pandas
+xarray
+pystac-client
+odc-stac
+rasterio
+pyproj
