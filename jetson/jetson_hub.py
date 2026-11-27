@@ -10,7 +10,6 @@ from datetime import datetime
 
 import hub_stream
 import yggdrasil
-from rylr896 import RYLR896
 
 NETWORK_ID = 5
 RADIO_BROADCAST_ADDR = 0
@@ -79,6 +78,27 @@ class CsvLog(object):
 
     def close(self):
         self.file.close()
+
+
+def record_row(record):
+    known = set(KNOWN_READINGS.values())
+    row = {
+        "timestamp": datetime.fromtimestamp(record["time"]).isoformat(timespec="seconds"),
+        "node_address": record["node"],
+        "via": record["via"],
+        "rssi": record["rssi"],
+        "snr": record["snr"],
+    }
+    extra = []
+    for name, value in record["readings"].items():
+        if isinstance(value, float):
+            value = round(value, 3)
+        if name in known:
+            row[name] = value
+        else:
+            extra.append(f"{name}={value}")
+    row["extra"] = ";".join(extra)
+    return row
 
 
 class WebSocketStream(object):
@@ -312,24 +332,7 @@ class Hub(object):
         }
 
     def log_record(self, record):
-        known = set(KNOWN_READINGS.values())
-        row = {
-            "timestamp": datetime.fromtimestamp(record["time"]).isoformat(timespec="seconds"),
-            "node_address": record["node"],
-            "via": record["via"],
-            "rssi": record["rssi"],
-            "snr": record["snr"],
-        }
-        extra = []
-        for name, value in record["readings"].items():
-            if isinstance(value, float):
-                value = round(value, 3)
-            if name in known:
-                row[name] = value
-            else:
-                extra.append(f"{name}={value}")
-        row["extra"] = ";".join(extra)
-        self.log.write(row)
+        self.log.write(record_row(record))
 
     @staticmethod
     def announce_delay():
@@ -397,6 +400,8 @@ def main():
     else:
         log = CsvLog(args.csv)
         print(f"Logging to {os.path.abspath(args.csv)}")
+
+    from rylr896 import RYLR896
 
     radio = RYLR896(port=args.port)
     try:
